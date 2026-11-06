@@ -72,6 +72,7 @@
 #endif
 
 #define MAX_READLINKS 32
+#define MAX_OPENAT2_EAGAIN_RETRIES 128
 
 int
 crun_path_exists (const char *path, libcrun_error_t *err)
@@ -198,10 +199,26 @@ get_file_type (mode_t *mode, bool nofollow, const char *path)
   return get_file_type_at (AT_FDCWD, mode, nofollow, path);
 }
 
+/* Return the ID of the mount PATH resides on, or 0 if it is not known.  */
+uint64_t
+get_mount_id (const char *path)
+{
+#if defined HAVE_STATX && defined STATX_MNT_ID
+  struct statx stx = {
+    0,
+  };
+
+  if (statx (AT_FDCWD, path, AT_SYMLINK_NOFOLLOW | AT_STATX_DONT_SYNC, STATX_MNT_ID, &stx) == 0
+      && (stx.stx_mask & STATX_MNT_ID))
+    return stx.stx_mnt_id;
+#endif
+  return 0;
+}
+
 int
 create_file_if_missing_at (int dirfd, const char *file, mode_t mode, libcrun_error_t *err)
 {
-  cleanup_close int fd_write = openat (dirfd, file, O_CLOEXEC | O_CREAT | O_WRONLY | O_NOFOLLOW, mode);
+  cleanup_close int fd_write = openat (dirfd, file, O_CLOEXEC | O_CREAT | O_WRONLY | O_NOFOLLOW | O_NONBLOCK, mode);
   if (fd_write < 0)
     {
       int saved_errno = errno;
@@ -432,6 +449,7 @@ safe_openat (int dirfd, const char *rootfs, const char *path, int flags, int mod
              libcrun_error_t *err)
 {
   static bool openat2_supported = true;
+  int retries = MAX_OPENAT2_EAGAIN_RETRIES;
   int ret;
 
   if (is_empty_string (path))
@@ -469,7 +487,13 @@ safe_openat (int dirfd, const char *rootfs, const char *path, int flags, int mod
       ret = syscall_openat2 (dirfd, path, flags, mode, RESOLVE_IN_ROOT);
       if (UNLIKELY (ret < 0))
         {
-          if (errno == EINTR || errno == EAGAIN)
+          if (errno == EINTR)
+            goto repeat;
+          /* With RESOLVE_IN_ROOT the kernel returns EAGAIN when a rename or a
+             mount happened anywhere on the system while a ".." component was
+             being resolved.  Any process can cause that, so give up after a
+             bounded number of attempts instead of retrying forever.  */
+          if (errno == EAGAIN && retries-- > 0)
             goto repeat;
           if (errno == ENOSYS)
             openat2_supported = false;
@@ -515,8 +539,36 @@ safe_readlinkat (int dfd, const char *name, char **buffer, ssize_t hint, libcrun
   return size;
 }
 
+static int crun_safe_ensure_at (bool do_open, bool dir, bool follow_symlinks, int dirfd, const char *dirpath,
+                                const char *path, int mode, int max_readlinks, libcrun_error_t *err);
+
+/* CUR is a symlink in the directory CWD, NPATH is the path up to and
+   including CUR, and REST is what follows CUR in the path, or NULL.
+   Restart the lookup with the symlink target in place of CUR, so that
+   anything missing on the way to the target is created.  */
 static int
-crun_safe_ensure_at (bool do_open, bool dir, int dirfd, const char *dirpath,
+crun_safe_ensure_follow_symlink (bool do_open, bool dir, bool follow_symlinks, int dirfd, const char *dirpath, int cwd,
+                                 const char *npath, const char *cur, const char *rest,
+                                 int mode, int max_readlinks, libcrun_error_t *err)
+{
+  cleanup_free char *target = NULL;
+  cleanup_free char *new_path = NULL;
+  ssize_t ret;
+
+  ret = safe_readlinkat (cwd, cur, &target, 0, err);
+  if (UNLIKELY (ret < 0))
+    return ret;
+
+  /* A relative target is relative to the directory containing the symlink,
+     which is the path before CUR.  */
+  xasprintf (&new_path, "%.*s%s%s%s", target[0] == '/' ? 0 : (int) (cur - npath), npath, target,
+             rest ? "/" : "", rest ? rest : "");
+
+  return crun_safe_ensure_at (do_open, dir, follow_symlinks, dirfd, dirpath, new_path, mode, max_readlinks - 1, err);
+}
+
+static int
+crun_safe_ensure_at (bool do_open, bool dir, bool follow_symlinks, int dirfd, const char *dirpath,
                      const char *path, int mode, int max_readlinks, libcrun_error_t *err)
 {
   cleanup_close int wd_cleanup = -1;
@@ -575,26 +627,18 @@ crun_safe_ensure_at (bool do_open, bool dir, int dirfd, const char *dirpath,
 
       if (last_component && ! dir)
         {
-          ret = openat (cwd, cur, O_CLOEXEC | O_CREAT | O_WRONLY | O_NOFOLLOW, 0700);
+          ret = openat (cwd, cur, O_CLOEXEC | O_CREAT | O_WRONLY | O_NOFOLLOW | O_NONBLOCK, 0700);
           if (UNLIKELY (ret < 0))
             {
-              /* If the last component is a symlink, repeat the lookup with the resolved path.  */
+              /* If the last component is a symlink, repeat the lookup with the resolved path.
+                 That lookup is confined to DIRFD, so its result is final: an openat without
+                 O_NOFOLLOW would follow the symlink from the process root instead.  */
               if (errno == ELOOP)
-                {
-                  cleanup_free char *resolved_path = NULL;
+                return crun_safe_ensure_follow_symlink (do_open, dir, follow_symlinks, dirfd, dirpath, cwd, npath, cur, NULL,
+                                                        mode, max_readlinks, err);
 
-                  ret = safe_readlinkat (cwd, cur, &resolved_path, 0, err);
-                  if (LIKELY (ret >= 0))
-                    {
-                      return crun_safe_ensure_at (do_open, dir, dirfd,
-                                                  dirpath,
-                                                  resolved_path, mode,
-                                                  max_readlinks - 1, err);
-                    }
-                  crun_error_release (err);
-                }
               /* If the previous openat fails, attempt to open the file in O_PATH mode.  */
-              ret = openat (cwd, cur, O_CLOEXEC | O_PATH, 0);
+              ret = openat (cwd, cur, O_CLOEXEC | O_PATH | O_NOFOLLOW, 0);
               if (ret < 0)
                 return crun_make_error (err, errno, "open `%s/%s`", dirpath, npath);
             }
@@ -609,11 +653,24 @@ crun_safe_ensure_at (bool do_open, bool dir, int dirfd, const char *dirpath,
       ret = mkdirat (cwd, cur, mode);
       if (ret < 0)
         {
+          mode_t st_mode;
+
           if (errno != EEXIST)
             return crun_make_error (err, errno, "mkdir `/%s`", npath);
+
+          /* If asked to, follow a symlink here, so that a dangling one gets
+             its target created, and the lookup of a relative target or a ".."
+             after it starts from the right directory.  This is done for mount
+             targets, not for the working directory, where both crun and runc
+             have always failed with a dangling symlink.  */
+          if (follow_symlinks && get_file_type_at (cwd, &st_mode, true, cur) == 0 && S_ISLNK (st_mode))
+            return crun_safe_ensure_follow_symlink (do_open, dir, follow_symlinks, dirfd, dirpath, cwd, npath, cur,
+                                                    it ? it + 1 : NULL, mode, max_readlinks, err);
         }
 
-      cwd = safe_openat (dirfd, dirpath, npath, (last_component ? O_PATH : 0) | O_CLOEXEC, 0, err);
+      /* The type of an existing component is not known yet, so open it with
+         O_PATH: a FIFO must not block and a device must not be opened.  */
+      cwd = safe_openat (dirfd, dirpath, npath, O_PATH | O_CLOEXEC, 0, err);
       if (UNLIKELY (cwd < 0))
         return crun_error_wrap (err, "creating `/%s`", path);
 
@@ -675,21 +732,21 @@ crun_safe_create_and_open_ref_at (bool dir, int dirfd, const char *dirpath, cons
     return ret;
 
   crun_error_release (err);
-  return crun_safe_ensure_at (true, dir, dirfd, dirpath, path, mode, MAX_READLINKS, err);
+  return crun_safe_ensure_at (true, dir, true, dirfd, dirpath, path, mode, MAX_READLINKS, err);
 }
 
 int
 crun_safe_ensure_directory_at (int dirfd, const char *dirpath, const char *path, int mode,
                                libcrun_error_t *err)
 {
-  return crun_safe_ensure_at (false, true, dirfd, dirpath, path, mode, MAX_READLINKS, err);
+  return crun_safe_ensure_at (false, true, false, dirfd, dirpath, path, mode, MAX_READLINKS, err);
 }
 
 int
 crun_safe_ensure_file_at (int dirfd, const char *dirpath, const char *path, int mode,
                           libcrun_error_t *err)
 {
-  return crun_safe_ensure_at (false, false, dirfd, dirpath, path, mode, MAX_READLINKS, err);
+  return crun_safe_ensure_at (false, false, false, dirfd, dirpath, path, mode, MAX_READLINKS, err);
 }
 
 int
@@ -1087,8 +1144,8 @@ set_apparmor_profile (libcrun_container_t *container, const char *profile, bool 
   return 0;
 }
 
-int
-read_all_fd_with_size_hint (int fd, const char *description, char **out, size_t *len, size_t size_hint, libcrun_error_t *err)
+static int
+read_all_fd_internal (int fd, const char *description, char **out, size_t *len, size_t size_hint, size_t max_size, libcrun_error_t *err)
 {
   cleanup_free char *buf = NULL;
   size_t nread, allocated;
@@ -1103,6 +1160,9 @@ read_all_fd_with_size_hint (int fd, const char *description, char **out, size_t 
       ret = get_file_size (fd, &size);
       if (UNLIKELY (ret < 0))
         return crun_make_error (err, errno, "stat `%s`", description);
+
+      if (max_size && (size_t) size > max_size)
+        return crun_make_error (err, EFBIG, "`%s` is bigger than %zu bytes", description, max_size);
 
       allocated = size == 0 ? 1023 : size;
     }
@@ -1120,6 +1180,9 @@ read_all_fd_with_size_hint (int fd, const char *description, char **out, size_t 
         break;
 
       nread += ret;
+
+      if (max_size && nread > max_size)
+        return crun_make_error (err, EFBIG, "`%s` is bigger than %zu bytes", description, max_size);
 
       if (nread == allocated)
         {
@@ -1148,6 +1211,18 @@ read_all_fd_with_size_hint (int fd, const char *description, char **out, size_t 
   if (len)
     *len = nread;
   return 0;
+}
+
+int
+read_all_fd_with_size_hint (int fd, const char *description, char **out, size_t *len, size_t size_hint, libcrun_error_t *err)
+{
+  return read_all_fd_internal (fd, description, out, len, size_hint, 0, err);
+}
+
+int
+read_all_fd_with_max_size (int fd, const char *description, char **out, size_t *len, size_t max_size, libcrun_error_t *err)
+{
+  return read_all_fd_internal (fd, description, out, len, 0, max_size, err);
 }
 
 int
@@ -1412,9 +1487,14 @@ epoll_helper_toggle (int epollfd, int fd, int events, libcrun_error_t *err)
   ev.events = events;
   ev.data.fd = fd;
   ret = epoll_ctl (epollfd, add ? EPOLL_CTL_ADD : EPOLL_CTL_DEL, fd, &ev);
+  /* The fd is already registered, possibly with a different mask.  */
+  if (UNLIKELY (ret < 0 && errno == EEXIST))
+    ret = epoll_ctl (epollfd, EPOLL_CTL_MOD, fd, &ev);
   if (UNLIKELY (ret < 0))
     {
-      if (errno == EEXIST || errno == ENOENT)
+      /* ENOENT: not registered.  EPERM: the fd is not supported by epoll,
+         such as a regular file or /dev/null, and is always ready.  */
+      if (errno == ENOENT || errno == EPERM)
         return 0;
       return crun_make_error (err, errno, "epoll_ctl `%s` `%d`", add ? "add" : "del", fd);
     }
@@ -1973,7 +2053,7 @@ mark_or_close_fds_ge_than (libcrun_container_t *container, int n, bool close_now
   ret = syscall_close_range (n, UINT_MAX, close_now ? 0 : CLOSE_RANGE_CLOEXEC);
   if (ret == 0)
     {
-      if (close_now && container->proc_fd >= n)
+      if (close_now && container && container->proc_fd >= n)
         container->proc_fd = -1;
       return 0;
     }
@@ -2013,7 +2093,7 @@ mark_or_close_fds_ge_than (libcrun_container_t *container, int n, bool close_now
           if (UNLIKELY (ret < 0))
             return crun_make_error (err, errno, "close fd `%d`", val);
 
-          if (val == container->proc_fd)
+          if (container && val == container->proc_fd)
             container->proc_fd = -1;
         }
       else
@@ -2637,7 +2717,11 @@ base64_decode (const char *iptr, size_t isize, char *optr, size_t osize, size_t 
           tmp = b64_input (*iptr++);
           consumed++;
           if (tmp != -1)
-            data[i++] = tmp;
+            {
+              if (UNLIKELY (pad > 0))
+                return -1;
+              data[i++] = tmp;
+            }
           else if (*(iptr - 1) == '=')
             {
               data[i++] = '\0';
@@ -2648,6 +2732,8 @@ base64_decode (const char *iptr, size_t isize, char *optr, size_t osize, size_t 
       /* I have an entire block of data 32 bits get the output data.  */
       if (i == 4)
         {
+          if (UNLIKELY (pad > 2))
+            return -1;
           *optr++ = (data[0] << 2) | ((data[1] & 0x30) >> 4);
           *optr++ = ((data[1] & 0xf) << 4) | ((data[2] & 0x3c) >> 2);
           *optr++ = ((data[2] & 0x3) << 6) | data[3];
@@ -3038,6 +3124,37 @@ channel_fd_pair_process (struct channel_fd_pair *channel, int epollfd, libcrun_e
             return ret;
           channel->outfd_epoll_events = events;
         }
+    }
+  return 0;
+}
+
+int
+channel_fd_pair_flush (struct channel_fd_pair *channel, libcrun_error_t *err)
+{
+  bool is_input_eagain = false, is_output_eagain = false;
+  int ret, i;
+
+  /* Something may still be writing to the input, so use a hard limit as
+     channel_fd_pair_process does.  */
+  for (i = 0; i < 1000; i++)
+    {
+      if (! is_input_eagain && ring_buffer_get_space_available (channel->rb) > 0)
+        {
+          ret = ring_buffer_read (channel->rb, channel->in_fd, &is_input_eagain, err);
+          if (UNLIKELY (ret < 0))
+            return ret;
+        }
+      if (ring_buffer_get_data_available (channel->rb) == 0)
+        {
+          if (is_input_eagain)
+            break;
+          continue;
+        }
+      ret = ring_buffer_write (channel->rb, channel->out_fd, &is_output_eagain, err);
+      if (UNLIKELY (ret < 0))
+        return ret;
+      if (is_output_eagain)
+        break;
     }
   return 0;
 }

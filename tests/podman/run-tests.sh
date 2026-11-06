@@ -25,8 +25,6 @@ export CGROUP_MANAGER=cgroupfs
 export STORAGE_OPTIONS="--storage-driver=overlay"
 export STORAGE_FS="overlay"
 
-export GO111MODULE=off
-
 ulimit -u unlimited
 export TMPDIR=/var/tmp
 
@@ -109,4 +107,4 @@ SKIP_REGEX=$(
 ginkgo --focus='.*' --skip="$SKIP_REGEX" \
     -v --show-node-events --trace \
     -tags "seccomp ostree selinux" \
-    -timeout=50m -cover -flake-attempts 3 -no-color test/e2e/.
+    -timeout=50m -flake-attempts 3 -no-color -p test/e2e/.

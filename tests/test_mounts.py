@@ -17,21 +17,27 @@
 
 import sys
 import copy
+import functools
+import importlib.util
 import socket
 import os
 import shutil
 import subprocess
 import json
+import time
 from tests_utils import *
 import tempfile
 import re
 from typing import List, Optional
 
-try:
-    import libmount
-except Exception:
-    print("1..0")
-    sys.exit(0)
+def requires_libmount(test):
+    """Skip TEST if the libmount python module is not available."""
+    @functools.wraps(test)
+    def wrapper():
+        if importlib.util.find_spec("libmount") is None:
+            return (77, "requires the libmount python module")
+        return test()
+    return wrapper
 
 def helper_mount(options: str, tmpfs: bool = True, userns: bool = False, is_file: bool = False) -> List[Optional[str]]:
     conf = base_config()
@@ -52,6 +58,7 @@ def helper_mount(options: str, tmpfs: bool = True, userns: bool = False, is_file
         with tempfile.NamedTemporaryFile(mode='w', delete=True) as f:
             f.write(out)
             f.flush()
+            import libmount
             t = libmount.Table(f.name)
             target = '/var/file' if is_file else '/var/dir'
             m = t.find_target(target)
@@ -176,6 +183,32 @@ def test_mount_tmpfs_explicit_mode():
     logger.info("tmpfs explicit mode test failed: expected '1777', got '%s'", out)
     return -1
 
+def test_mount_tmpfs_symlink_mode():
+    # The mode of the mountpoint must be looked up inside the rootfs: a
+    # mountpoint that is a symlink to a host path must take the mode of
+    # that path inside the rootfs, not disclose the mode of the host one.
+    host_dir = tempfile.mkdtemp(dir=get_tests_root())
+    os.chmod(host_dir, 0o712)
+
+    def prepare_rootfs(rootfs):
+        os.symlink(host_dir, os.path.join(rootfs, "test-tmpfs"))
+        path = os.path.join(rootfs, host_dir.lstrip("/"))
+        os.makedirs(path)
+        os.chmod(path, 0o750)
+
+    conf = base_config()
+    conf['process']['args'] = ['/init', 'mode', '/test-tmpfs']
+    add_all_namespaces(conf)
+    conf['mounts'].append({"destination": "/test-tmpfs", "type": "tmpfs", "source": "tmpfs", "options": ["ro"]})
+    try:
+        out, _ = run_and_get_output(conf, hide_stderr=True, callback_prepare_rootfs=prepare_rootfs)
+    finally:
+        shutil.rmtree(host_dir)
+    if out.strip() == "750":
+        return 0
+    logger.info("tmpfs symlink mode test failed: expected '750', got '%s'", out)
+    return -1
+
 def test_mount_bind_to_rootfs():
     if is_rootless():
         return (77, "requires root for bind mount to rootfs")
@@ -191,6 +224,41 @@ def test_mount_bind_to_rootfs():
     ]
     conf['mounts'] = mounts + conf['mounts']
     _, _ = run_and_get_output(conf, hide_stderr=True)
+    return 0
+
+def test_mount_bind_source_in_rootfs():
+    # A bind mount source inside the container rootfs refers to what is
+    # there at the time of the mount, including the mounts done before it.
+    conf = base_config()
+    conf['process']['args'] = ['/init', 'cat', '/b/file']
+    add_all_namespaces(conf)
+    srcdir = tempfile.mkdtemp(dir=get_tests_root())
+    with open(os.path.join(srcdir, "file"), "w") as f:
+        f.write("hello")
+
+    def prepare_rootfs(rootfs):
+        rootfs = os.path.realpath(rootfs)
+        os.makedirs(os.path.join(rootfs, "a"))
+        os.makedirs(os.path.join(rootfs, "b"))
+        # The absolute rootfs path is known only now, so add the mounts to the
+        # config file that is already written.
+        config_path = os.path.join(os.path.dirname(rootfs), "config.json")
+        with open(config_path) as f:
+            config = json.load(f)
+        config['mounts'] += [
+            {"destination": "/a", "type": "bind", "source": srcdir, "options": ["bind"]},
+            {"destination": "/b", "type": "bind", "source": os.path.join(rootfs, "a"), "options": ["bind"]},
+        ]
+        with open(config_path, "w") as f:
+            json.dump(config, f)
+
+    try:
+        out, _ = run_and_get_output(conf, hide_stderr=True, callback_prepare_rootfs=prepare_rootfs)
+    finally:
+        shutil.rmtree(srcdir)
+    if "hello" not in out:
+        sys.stderr.write("# unexpected output: %s\n" % out)
+        return -1
     return 0
 
 def test_mount_tmpfs_to_rootfs():
@@ -269,6 +337,15 @@ def test_ro_cgroup():
                                 logger.error("fail with cgroupns=%s, netns=%s, userns=%s and cgroup_mount=%s, /sys options: %s", cgroupns, netns, userns, has_cgroup_mount, fields[5])
                                 return -1
                             break
+
+                    # When the host /sys is bind mounted in place of a new
+                    # sysfs, the mounts below it must be read-only as well.
+                    for i in out.split("\n"):
+                        fields = i.split(" ")
+                        if len(fields) >= 6 and fields[4].startswith("/sys/"):
+                            if "ro" not in fields[5].split(","):
+                                logger.error("fail with cgroupns=%s, netns=%s, userns=%s and cgroup_mount=%s, got=%s", cgroupns, netns, userns, has_cgroup_mount, i)
+                                return -1
     return 0
 
 def test_mount_symlink_not_existing():
@@ -347,6 +424,7 @@ def test_mount_path_with_multiple_slashes():
         return 0
     return -1
 
+@requires_libmount
 def test_mount_ro():
     for userns in [True, False]:
         a = helper_mount("ro", userns=userns, is_file=True)[0]
@@ -360,6 +438,7 @@ def test_mount_ro():
             return -1
     return 0
 
+@requires_libmount
 def test_mount_rro():
     for userns in [True, False]:
         a = helper_mount("rro", userns=userns, is_file=True)[0]
@@ -373,6 +452,7 @@ def test_mount_rro():
             return -1
     return 0
 
+@requires_libmount
 def test_mount_rw():
     for userns in [True, False]:
         a = helper_mount("rw", tmpfs=False, userns=userns)[0]
@@ -386,6 +466,7 @@ def test_mount_rw():
             return -1
     return 0
 
+@requires_libmount
 def test_mount_relatime():
     for userns in [True, False]:
         a = helper_mount("relatime", tmpfs=False, userns=userns)[0]
@@ -399,6 +480,7 @@ def test_mount_relatime():
             return -1
     return 0
 
+@requires_libmount
 def test_mount_strictatime():
     for userns in [True, False]:
         a = helper_mount("strictatime", is_file=True, userns=userns)[0]
@@ -412,6 +494,7 @@ def test_mount_strictatime():
             return 0
     return -1
 
+@requires_libmount
 def test_mount_exec():
     for userns in [True, False]:
         a = helper_mount("exec", is_file=True, userns=userns)[0]
@@ -425,6 +508,7 @@ def test_mount_exec():
             return -1
     return 0
 
+@requires_libmount
 def test_mount_noexec():
     for userns in [True, False]:
         a = helper_mount("noexec", is_file=True, userns=userns)[0]
@@ -438,6 +522,7 @@ def test_mount_noexec():
             return -1
     return 0
 
+@requires_libmount
 def test_mount_suid():
     for userns in [True, False]:
         a = helper_mount("suid", is_file=True, userns=userns)[0]
@@ -451,6 +536,7 @@ def test_mount_suid():
             return -1
     return 0
 
+@requires_libmount
 def test_mount_nosuid():
     for userns in [True, False]:
         a = helper_mount("nosuid", is_file=True, userns=userns)[0]
@@ -464,6 +550,7 @@ def test_mount_nosuid():
             return -1
     return 0
 
+@requires_libmount
 def test_mount_sync():
     for userns in [True, False]:
         a = helper_mount("sync", userns=userns)[1]
@@ -471,6 +558,7 @@ def test_mount_sync():
             return -1
     return 0
 
+@requires_libmount
 def test_mount_dirsync():
     for userns in [True, False]:
         a = helper_mount("dirsync", userns=userns)[1]
@@ -478,6 +566,7 @@ def test_mount_dirsync():
             return -1
     return 0
 
+@requires_libmount
 def test_mount_nodev():
     for userns in [True, False]:
         a = helper_mount("nodev", is_file=True)[0]
@@ -491,6 +580,7 @@ def test_mount_nodev():
             return -1
     return 0
 
+@requires_libmount
 def test_mount_dev():
     for userns in [True, False]:
         a = helper_mount("dev", userns=userns, tmpfs=False)[0]
@@ -717,6 +807,8 @@ def test_cgroup_mount_without_netns():
 def test_add_remove_mounts():
     if is_rootless():
         return (77, "requires root privileges")
+    if not is_openat2_available():
+        return (77, "requires openat2")
     conf = base_config()
 
     conf['mounts'].append({"destination": "/foo", "type": "tmpfs", "source": "tmpfs", "options": ["rw"]})
@@ -779,6 +871,202 @@ def test_add_remove_mounts():
         if cid is not None:
             run_crun_command(["delete", "-f", cid])
         shutil.rmtree(bind_dir)
+    return 0
+
+def test_remove_mounts_no_symlinks():
+    if is_rootless():
+        return (77, "requires root privileges")
+    if not is_openat2_available():
+        return (77, "requires openat2")
+    conf = base_config()
+    add_all_namespaces(conf)
+    conf['linux']['readonlyPaths'] = ["/proc/sys"]
+    conf['process']['args'] = ['/init', 'pause']
+
+    def prepare_rootfs(rootfs):
+        os.symlink("/proc/sys", os.path.join(rootfs, "last-component"))
+        os.symlink("/proc", os.path.join(rootfs, "parent"))
+
+    def count_proc_sys_mounts():
+        out = run_crun_command(["exec", cid, "/init", "cat", "/proc/self/mountinfo"])
+        return len(re.findall(r" /proc/sys ", out))
+
+    mounts_path = os.path.join(get_tests_root(), "mounts-no-symlinks.json")
+
+    cid = None
+    try:
+        _, cid = run_and_get_output(conf, detach=True, callback_prepare_rootfs=prepare_rootfs)
+
+        if count_proc_sys_mounts() != 1:
+            logger.info("/proc/sys is not a mount point")
+            return -1
+
+        # The symlinks can be created by the container, they must not be followed.
+        for destination in ["/last-component", "/parent/sys"]:
+            with open(mounts_path, "w+") as f:
+                json.dump([{"destination": destination}], f)
+            try:
+                run_crun_command_raw(["mounts", "remove", cid, mounts_path])
+                logger.info("mounts remove `%s` did not fail", destination)
+                return -1
+            except subprocess.CalledProcessError:
+                pass
+            if count_proc_sys_mounts() != 1:
+                logger.info("mounts remove `%s` detached /proc/sys", destination)
+                return -1
+
+            with open(mounts_path, "w+") as f:
+                json.dump([{"destination": destination, "type": "tmpfs", "source": "tmpfs"}], f)
+            try:
+                run_crun_command_raw(["mounts", "add", cid, mounts_path])
+                logger.info("mounts add `%s` did not fail", destination)
+                return -1
+            except subprocess.CalledProcessError:
+                pass
+            if count_proc_sys_mounts() != 1:
+                logger.info("mounts add `%s` changed the mounts on /proc/sys", destination)
+                return -1
+    finally:
+        if cid is not None:
+            run_crun_command(["delete", "-f", cid])
+    return 0
+
+def helper_add_mounts_nested_userns(init_arg: str, expect_failure: bool) -> int:
+    if is_rootless():
+        return (77, "requires root privileges")
+    if not is_openat2_available():
+        return (77, "requires openat2")
+
+    bind_dir = os.path.join(get_tests_root(), "bind-mount")
+    os.makedirs(bind_dir, exist_ok=True)
+    mounts_path = os.path.join(get_tests_root(), "mounts.json")
+    with open(mounts_path, "w+") as f:
+        json.dump([{"destination": "/foo/bar", "type": "bind", "source": bind_dir, "options": ["bind", "ro"]},
+                   {"destination": "/foo/tmpfs", "type": "tmpfs", "source": "tmpfs", "options": ["size=64k"]}], f)
+
+    for userns in [False, True]:
+        conf = base_config()
+        conf['mounts'].append({"destination": "/foo", "type": "tmpfs", "source": "tmpfs", "options": ["rw"]})
+        add_all_namespaces(conf, userns=userns)
+        if userns:
+            fullMapping = [
+                {
+                    "containerID": 0,
+                    "hostID": 1,
+                    "size": 10
+                }
+            ]
+            conf['linux']['uidMappings'] = fullMapping
+            conf['linux']['gidMappings'] = fullMapping
+        conf['process']['args'] = ['/init', init_arg]
+
+        cid = None
+        try:
+            _, cid = run_and_get_output(conf, detach=True, chown_rootfs_to=1 if userns else None)
+            pid = json.loads(run_crun_command(['state', cid]))['pid']
+
+            # wait for the container process to be in its own user namespace
+            for _ in range(100):
+                try:
+                    with open("/proc/%d/uid_map" % pid) as f:
+                        if f.read().strip() == "":
+                            break
+                except FileNotFoundError:
+                    return (77, "cannot create a nested user namespace")
+                time.sleep(0.05)
+            else:
+                return (77, "cannot create a nested user namespace")
+
+            if expect_failure:
+                try:
+                    run_crun_command_raw(["mounts", "add", cid, mounts_path])
+                    logger.info("userns=%s: mounts add did not fail", userns)
+                    return -1
+                except subprocess.CalledProcessError as e:
+                    if b"user namespace of the container" not in e.output:
+                        logger.info("userns=%s: unexpected error: %s", userns, e.output)
+                        return -1
+            else:
+                run_crun_command(["mounts", "add", cid, mounts_path])
+                # exec would join the nested user namespace, which has no
+                # mappings, so read the mounts of the container process.
+                with open("/proc/%d/mountinfo" % pid) as f:
+                    out = f.read()
+                if not re.search(r" /foo/tmpfs .* - tmpfs .*size=64k", out):
+                    logger.info("userns=%s: /foo/tmpfs not mounted with size=64k", userns)
+                    return -1
+        finally:
+            if cid is not None:
+                run_crun_command(["delete", "-f", cid])
+    return 0
+
+
+def test_add_mounts_nested_userns_mountns():
+    """mounts add must fail if the container process moved to a mount namespace owned by a nested user namespace."""
+    return helper_add_mounts_nested_userns('nested-userns-mountns', True)
+
+
+def test_add_mounts_nested_userns():
+    """mounts add must create the file systems in the user namespace of the container, not in the nested one the container process moved to."""
+    return helper_add_mounts_nested_userns('nested-userns', False)
+
+
+def test_add_mounts_container_namespaces():
+    if is_rootless():
+        return (77, "requires root privileges")
+    if not is_openat2_available():
+        return (77, "requires openat2")
+
+    new_mounts = [{"destination": "/foo/tmpfs", "type": "tmpfs", "source": "tmpfs", "options": ["nosuid", "nodev", "size=64k", "mode=0700"]},
+                  {"destination": "/foo/proc", "type": "proc", "source": "proc", "options": ["nosuid", "nodev", "noexec"]}]
+    mounts_path = os.path.join(get_tests_root(), "mounts-container-namespaces.json")
+    with open(mounts_path, "w+") as f:
+        json.dump(new_mounts, f)
+
+    for userns in [False, True]:
+        conf = base_config()
+        conf['mounts'].append({"destination": "/foo", "type": "tmpfs", "source": "tmpfs", "options": ["rw"]})
+        add_all_namespaces(conf, userns=userns)
+        if userns:
+            fullMapping = [
+                {
+                    "containerID": 0,
+                    "hostID": 1,
+                    "size": 10
+                }
+            ]
+            conf['linux']['uidMappings'] = fullMapping
+            conf['linux']['gidMappings'] = fullMapping
+        conf['process']['args'] = ['/init', 'pause']
+
+        cid = None
+        try:
+            _, cid = run_and_get_output(conf, detach=True, chown_rootfs_to=1 if userns else None)
+
+            run_crun_command(["mounts", "add", cid, mounts_path])
+
+            # The options that are not mount flags must be honored.
+            out = run_crun_command(["exec", cid, "/init", "cat", "/proc/self/mountinfo"])
+            if not re.search(r" /foo/tmpfs .* - tmpfs .*size=64k", out):
+                logger.info("userns=%s: /foo/tmpfs not mounted with size=64k", userns)
+                return -1
+            out = run_crun_command(["exec", cid, "/init", "mode", "/foo/tmpfs"])
+            if out != "700":
+                logger.info("userns=%s: wrong mode for /foo/tmpfs: %s", userns, out)
+                return -1
+            out = run_crun_command(["exec", cid, "/init", "owner", "/foo/tmpfs"])
+            if out != "0:0":
+                logger.info("userns=%s: wrong owner for /foo/tmpfs: %s", userns, out)
+                return -1
+
+            # The file system must be created in the namespaces of the container.
+            out = run_crun_command(["exec", cid, "/init", "cat", "/foo/proc/1/cmdline"])
+            if not out.startswith("/init\0pause"):
+                logger.info("userns=%s: /foo/proc is not for the container PID namespace: %s", userns, out)
+                return -1
+        finally:
+            if cid is not None:
+                run_crun_command(["delete", "-f", cid])
     return 0
 
 def test_mount_help():
@@ -915,6 +1203,7 @@ def test_bind_mount_flags():
     """Check the flags of a bind mount with options are exactly the requested ones.
 
     The flags of the source not requested (explicitly or not) must be cleared.
+    With no mount flag options at all, the flags of the source must be kept.
     """
     if is_rootless():
         return (77, "requires root privileges")
@@ -931,6 +1220,12 @@ def test_bind_mount_flags():
             ("ro,nosuid,nodev,noexec", ["bind", "dev", "suid", "exec"], ["rw"], ["ro", "nosuid", "nodev", "noexec"]),
             ("ro,nosuid,nodev,noexec", ["bind", "ro"], ["ro"], ["nosuid", "nodev", "noexec"]),
             ("ro,nosuid,nodev,noexec", ["bind", "nosuid"], ["rw", "nosuid"], ["ro", "nodev", "noexec"]),
+            # MS_REC and the propagation are not mount flags.
+            ("ro,nosuid,nodev,noexec", ["bind"], ["ro", "nosuid", "nodev", "noexec"], ["rw"]),
+            ("ro,nosuid,nodev,noexec", ["rbind"], ["ro", "nosuid", "nodev", "noexec"], ["rw"]),
+            ("ro,nosuid,nodev,noexec", ["bind", "private"], ["ro", "nosuid", "nodev", "noexec"], ["rw"]),
+            ("ro,nosuid,nodev,noexec", ["rbind", "rprivate"], ["ro", "nosuid", "nodev", "noexec"], ["rw"]),
+            ("ro,nosuid,nodev,noexec", ["rbind", "rslave"], ["ro", "nosuid", "nodev", "noexec"], ["rw"]),
             # Setting an atime flag resets the others, like mount(2) does.
             ("rw,noatime", ["bind", "relatime"], ["relatime"], ["noatime"]),
             ("rw,noatime", ["bind", "nodiratime"], ["nodiratime", "relatime"], ["noatime"]),
@@ -1348,11 +1643,12 @@ def test_mount_propagation_shared():
                 return -1
         logger.info("bind mount at /mnt has no shared peer group")
         logger.info("mountinfo line: %s", line)
-        return -1
+        return (77, "known issue https://github.com/containers/crun/issues/2392")
     logger.info("/mnt not found in mountinfo")
     logger.info("mountinfo output: %s", out)
     return -1
 
+@requires_libmount
 def test_mount_tmpfs_size():
     """Verify tmpfs mounts with size= data option work via fsopen_mount."""
     conf = base_config()
@@ -1368,6 +1664,7 @@ def test_mount_tmpfs_size():
     with tempfile.NamedTemporaryFile(mode='w', delete=True) as f:
         f.write(out)
         f.flush()
+        import libmount
         t = libmount.Table(f.name)
         m = t.find_target('/sized-tmpfs')
         if m is None:
@@ -1378,6 +1675,7 @@ def test_mount_tmpfs_size():
             return -1
     return 0
 
+@requires_libmount
 def test_mount_tmpfs_size_userns():
     """Verify tmpfs with data options works inside a user namespace.
 
@@ -1398,6 +1696,7 @@ def test_mount_tmpfs_size_userns():
     with tempfile.NamedTemporaryFile(mode='w', delete=True) as f:
         f.write(out)
         f.flush()
+        import libmount
         t = libmount.Table(f.name)
         m = t.find_target('/sized-tmpfs')
         if m is None:
@@ -1420,7 +1719,7 @@ def test_mount_overlay_fs():
     if is_rootless():
         return (77, "requires root privileges")
 
-    overlay_base = tempfile.mkdtemp(prefix="crun-overlay-test-")
+    overlay_base = tempfile.mkdtemp(prefix="crun-overlay-test-", dir=get_tests_root())
     lower = os.path.join(overlay_base, "lower")
     upper = os.path.join(overlay_base, "upper")
     work = os.path.join(overlay_base, "work")
@@ -1569,6 +1868,7 @@ all_tests = {
     "mount-symlink-not-existing" : test_mount_symlink_not_existing,
     "mount-dev" : test_mount_dev,
     "mount-bind-to-rootfs": test_mount_bind_to_rootfs,
+    "mount-bind-source-in-rootfs": test_mount_bind_source_in_rootfs,
     "mount-tmpfs-to-rootfs": test_mount_tmpfs_to_rootfs,
     "mount-nodev" : test_mount_nodev,
     "mount-path-with-multiple-slashes" : test_mount_path_with_multiple_slashes,
@@ -1588,7 +1888,12 @@ all_tests = {
     "mount-tmpfs-permissions": test_mount_tmpfs_permissions,
     "mount-proc-mode": test_mount_proc_mode,
     "mount-tmpfs-explicit-mode": test_mount_tmpfs_explicit_mode,
+    "mount-tmpfs-symlink-mode": test_mount_tmpfs_symlink_mode,
     "mount-add-remove-mounts": test_add_remove_mounts,
+    "mount-remove-mounts-no-symlinks": test_remove_mounts_no_symlinks,
+    "mount-add-mounts-container-namespaces": test_add_mounts_container_namespaces,
+    "mount-add-mounts-nested-userns-mountns": test_add_mounts_nested_userns_mountns,
+    "mount-add-mounts-nested-userns": test_add_mounts_nested_userns,
     "mount-help": test_mount_help,
     "annotation-mount-context-type": test_annotation_mount_context_type,
     "mount-propagation-private": test_mount_propagation_private,

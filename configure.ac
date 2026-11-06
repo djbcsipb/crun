@@ -52,10 +52,6 @@ CFLAGS="$crun_save_CFLAGS"
 AS_IF([test "x$enable_werror" = "xyes"], [WARN_CFLAGS="$WARN_CFLAGS -Werror"])
 AC_SUBST([WARN_CFLAGS])
 
-AC_PATH_PROG(MD2MAN, go-md2man)
-
-AM_CONDITIONAL([HAVE_MD2MAN], [test "x$ac_cv_path_MD2MAN" != x])
-
 AC_CHECK_HEADERS([linux/openat2.h stdatomic.h linux/ioprio.h])
 
 AC_CHECK_TYPES([atomic_int], [], [], [[#include <stdatomic.h>]])
@@ -208,6 +204,7 @@ AS_IF([test "x$enable_seccomp" != "xno"], [
 	AS_IF([test "$ac_cv_header_seccomp_h" = "yes"], [
 		AC_SEARCH_LIBS(seccomp_rule_add, [seccomp], [AC_DEFINE([HAVE_SECCOMP], 1, [Define if seccomp is available])], [AC_MSG_ERROR([*** libseccomp headers not found])])
 		AC_SEARCH_LIBS(seccomp_arch_resolve_name, [seccomp], [AC_DEFINE([SECCOMP_ARCH_RESOLVE_NAME], 1, [Define if seccomp_arch_resolve_name is available])], [ ])
+		AC_CHECK_FUNCS(seccomp_export_bpf_mem)
 	])
 ])
 
@@ -303,9 +300,10 @@ AS_IF([test "x$use_fPIC" = "xyes"], [
 ])
 
 dnl criu
-AC_ARG_ENABLE([criu], AS_HELP_STRING([--disable-criu], [Disable CRIU based checkpoint/restore support]))
+AC_ARG_ENABLE([criu], AS_HELP_STRING([--enable-criu], [CRIU based checkpoint/restore support (yes/no, default: autodetect)]))
 AS_IF([test "x$enable_criu" != "xno"], [
 	PKG_CHECK_MODULES([CRIU], [criu >= 3.15], [have_criu="yes"], [have_criu="no"
+		AS_IF([test "x$enable_criu" = "xyes"], [AC_MSG_ERROR([*** CRIU headers not found; install libcriu or use --disable-criu])])
 		AC_MSG_NOTICE([CRIU headers not found, building without CRIU support])])
 	PKG_CHECK_MODULES([CRIU_JOIN_NS], [criu > 3.16], [have_criu_join_ns="yes"], [have_criu_join_ns="no"
 	        AC_MSG_NOTICE([CRIU version doesn't support join-ns API])])
@@ -329,6 +327,13 @@ AS_IF([test "x$enable_criu" != "xno"], [
 	])
 	AS_IF([test "$have_criu_config_file" = "yes"], [
 		AC_DEFINE([CRIU_CONFIG_FILE], 1, [Define if CRIU_CONFIG_FILE is available])
+	])
+	AS_IF([test "$have_criu" = "yes"], [
+		saved_CFLAGS=$CFLAGS
+		CFLAGS="$CFLAGS $CRIU_CFLAGS"
+		AC_CHECK_DECL([criu_set_lazy_pages], [AC_DEFINE([CRIU_LAZY_PAGES], 1, [Define if libcriu supports lazy pages])],
+			[AC_MSG_NOTICE([libcriu version doesn't support lazy pages])], [[#include <criu/criu.h>]])
+		CFLAGS=$saved_CFLAGS
 	])
 
 ], [AC_MSG_NOTICE([CRIU support disabled per user request])])

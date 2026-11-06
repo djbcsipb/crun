@@ -86,18 +86,22 @@ libcrun_SOURCES += src/libcrun/blake3/blake3.c \
 endif
 
 libcrun_la_SOURCES = $(libcrun_SOURCES)
-libcrun_la_CFLAGS = $(WARN_CFLAGS) -I $(abs_top_builddir)/libocispec/src -I $(abs_top_srcdir)/libocispec/src $(JSON_C_CFLAGS) -fvisibility=hidden $(SANITIZER_CFLAGS)
+libcrun_la_CFLAGS = $(WARN_CFLAGS) -I $(abs_top_builddir)/libocispec/src -I $(abs_top_srcdir)/libocispec/src $(JSON_C_CFLAGS) -fvisibility=hidden -D CRUN_LIBDIR="\"$(CRUN_LIBDIR)\"" $(SANITIZER_CFLAGS)
 if ENABLE_COVERAGE
 libcrun_la_CFLAGS += $(COVERAGE_CFLAGS)
-libcrun_la_LDFLAGS = -Wl,--version-script=$(abs_top_srcdir)/libcrun.lds $(COVERAGE_LDFLAGS) $(SANITIZER_LDFLAGS)
+libcrun_la_LDFLAGS = -version-info 1:0:0 -Wl,--version-script=$(abs_top_srcdir)/libcrun.lds $(COVERAGE_LDFLAGS) $(SANITIZER_LDFLAGS)
 else
-libcrun_la_LDFLAGS = -Wl,--version-script=$(abs_top_srcdir)/libcrun.lds $(SANITIZER_LDFLAGS)
+libcrun_la_LDFLAGS = -version-info 1:0:0 -Wl,--version-script=$(abs_top_srcdir)/libcrun.lds $(SANITIZER_LDFLAGS)
+endif
+
+if ENABLE_LIBCRUN
+include_HEADERS = src/libcrun/libcrun.h
 endif
 libcrun_la_LIBADD = libocispec/libocispec.la $(FOUND_LIBS) $(JSON_C_LIBS)
 
 # build a version with all the symbols visible for testing
 libcrun_testing_la_SOURCES = $(libcrun_SOURCES)
-libcrun_testing_la_CFLAGS = $(WARN_CFLAGS) -I $(abs_top_builddir)/libocispec/src -I $(abs_top_srcdir)/libocispec/src $(JSON_C_CFLAGS) -fvisibility=default $(SANITIZER_CFLAGS)
+libcrun_testing_la_CFLAGS = $(WARN_CFLAGS) -I $(abs_top_builddir)/libocispec/src -I $(abs_top_srcdir)/libocispec/src $(JSON_C_CFLAGS) -fvisibility=default -D CRUN_LIBDIR="\"$(CRUN_LIBDIR)\"" $(SANITIZER_CFLAGS)
 if ENABLE_COVERAGE
 libcrun_testing_la_CFLAGS += $(COVERAGE_CFLAGS)
 libcrun_testing_la_LDFLAGS = $(COVERAGE_LDFLAGS) $(SANITIZER_LDFLAGS)
@@ -109,7 +113,7 @@ libcrun_testing_la_LIBADD = libocispec/libocispec.la $(JSON_C_LIBS)
 if PYTHON_BINDINGS
 pyexec_LTLIBRARIES = python_crun.la
 python_crun_la_SOURCES = python/crun_python.c
-python_crun_la_CFLAGS = $(WARN_CFLAGS) -I $(abs_top_srcdir)/libocispec/src -I $(abs_top_builddir)/libocispec/src $(JSON_C_CFLAGS) -I $(abs_top_builddir)/src $(PYTHON_CFLAGS)
+python_crun_la_CFLAGS = $(WARN_CFLAGS) -I $(abs_top_srcdir)/src $(PYTHON_CFLAGS)
 python_crun_la_LDFLAGS = -avoid-version -module $(PYTHON_LDFLAGS)
 python_crun_la_LIBADD = libcrun.la $(PYTHON_LIBS) $(FOUND_LIBS) $(JSON_C_LIBS)
 endif
@@ -117,7 +121,7 @@ endif
 if LUA_BINDINGS
 luaexec_LTLIBRARIES = luacrun.la
 luacrun_la_SOURCES = lua/lua_crun.c
-luacrun_la_CFLAGS = $(WARN_CFLAGS) -I $(abs_top_srcdir)/libocispec/src -I $(abs_top_builddir)/libocispec/src $(JSON_C_CFLAGS) -I $(abs_top_builddir)/src $(LUA_INCLUDE)
+luacrun_la_CFLAGS = $(WARN_CFLAGS) -I $(abs_top_srcdir)/src $(LUA_INCLUDE)
 luacrun_la_LDFLAGS = -avoid-version -module
 luacrun_la_LIBADD = libcrun.la $(LUA_LIB) $(FOUND_LIBS)
 
@@ -146,7 +150,11 @@ dist-luarock: $(LUACRUN_ROCK)
 
 endif
 
-crun_CFLAGS = $(WARN_CFLAGS) -I $(abs_top_builddir)/libocispec/src -I $(abs_top_srcdir)/libocispec/src $(JSON_C_CFLAGS) -D CRUN_LIBDIR="\"$(CRUN_LIBDIR)\"" $(SANITIZER_CFLAGS)
+# The crun binary is a pure consumer of the public libcrun API: it includes
+# only <libcrun.h> and links dynamically against libcrun.so.  It therefore
+# does NOT get the libocispec/json-c include paths -- if a binary source file
+# ever reaches for an internal header the build breaks, which is intentional.
+crun_CFLAGS = $(WARN_CFLAGS) -I $(abs_top_srcdir)/src -D CRUN_LIBDIR="\"$(CRUN_LIBDIR)\"" $(SANITIZER_CFLAGS)
 if ENABLE_COVERAGE
 crun_CFLAGS += $(COVERAGE_CFLAGS)
 endif
@@ -161,17 +169,23 @@ else
 crun_LDFLAGS = -Wl,--unresolved-symbols=ignore-all $(CRUN_LDFLAGS) $(SANITIZER_LDFLAGS)
 endif
 else
-crun_LDADD = libcrun.la $(FOUND_LIBS) $(JSON_C_LIBS)
+# The crun binary links dynamically against libcrun; it resolves 100% of its
+# libcrun symbols from the public API exported by libcrun.lds.  There is no
+# -static-libtool-libs smuggling: if a binary source file reaches for a symbol
+# that is not part of the public API, the dynamic link fails, which is
+# intentional.  It links only against libcrun (no direct libocispec/json-c/
+# system deps): those are transitively provided by libcrun.so.
+crun_LDADD = libcrun.la
 if ENABLE_COVERAGE
-crun_LDFLAGS = $(CRUN_LDFLAGS) $(COVERAGE_LDFLAGS) $(SANITIZER_LDFLAGS)
+crun_LDFLAGS = -Wl,--as-needed $(CRUN_LDFLAGS) $(COVERAGE_LDFLAGS) $(SANITIZER_LDFLAGS)
 else
-crun_LDFLAGS = $(CRUN_LDFLAGS) $(SANITIZER_LDFLAGS)
+crun_LDFLAGS = -Wl,--as-needed $(CRUN_LDFLAGS) $(SANITIZER_LDFLAGS)
 endif
 endif
 
-EXTRA_DIST = COPYING COPYING.libcrun README.md NEWS SECURITY.md crun.keyring rpm/crun.spec autogen.sh \
+EXTRA_DIST = COPYING COPYING.libcrun README.md NEWS SECURITY.md THREAT_MODEL.md crun.keyring rpm/crun.spec autogen.sh \
 	src/libcrun/blake3/blake3_impl.h src/libcrun/blake3/blake3.h \
-	src/crun.h src/list.h src/run.h src/run_create.h src/delete.h src/kill.h src/pause.h src/unpause.h \
+	src/crun.h src/crun_utils.h src/list.h src/run.h src/run_create.h src/delete.h src/kill.h src/pause.h src/unpause.h \
 	src/create.h src/start.h src/state.h src/exec.h src/oci_features.h src/spec.h src/update.h src/ps.h src/mounts.h \
 	src/checkpoint.h src/restore.h src/libcrun/seccomp_notify.h src/libcrun/seccomp_notify_plugin.h \
 	src/libcrun/container.h src/libcrun/seccomp.h src/libcrun/ebpf.h \
@@ -308,6 +322,7 @@ PYTHON_TESTS = tests/test_capabilities.py \
 	tests/test_devices.py \
 	tests/test_hostname.py \
 	tests/test_domainname.py \
+	tests/test_sysctl.py \
 	tests/test_limits.py \
 	tests/test_oci_features.py \
 	tests/test_mempolicy.py \
@@ -368,13 +383,18 @@ check-systemd:
 .version:
 	$(AM_V_GEN)echo $(VERSION) > $@-t && mv $@-t $@
 
-git-version.h:
+git-version.h: FORCE
 	@if test -e $(abs_top_srcdir)/.tarball-git-version.h; then \
-		cp $(abs_top_srcdir)/.tarball-git-version.h $@; \
+		cp $(abs_top_srcdir)/.tarball-git-version.h $@-t || { rm -f $@-t; exit 1; }; \
 	elif test -e $(abs_top_srcdir)/.git; then \
 		version=`$(AM__GEN)git --git-dir=$(abs_top_srcdir)/.git rev-parse HEAD`; \
-		$(AM__GEN)printf "/* autogenerated.  */\n#ifndef GIT_VERSION\n# define GIT_VERSION \"%s\"\n#endif\n" $$version > $@-t && mv $@-t $@; \
+		$(AM__GEN)printf "/* autogenerated.  */\n#ifndef GIT_VERSION\n# define GIT_VERSION \"%s\"\n#endif\n" $$version > $@-t || { rm -f $@-t; exit 1; }; \
+	fi; \
+	if test -e $@-t; then \
+		if cmp -s $@-t $@; then rm -f $@-t; else mv $@-t $@; fi; \
 	fi
+
+FORCE:
 
 nixpkgs:
 	@nix --extra-experimental-features "nix-command flakes" flake update
@@ -383,7 +403,7 @@ dist-hook:
 	$(AM_V_GEN)echo $(VERSION) > $(distdir)/.tarball-version
 	$(AM__GEN)cp git-version.h $(distdir)/.tarball-git-version.h
 
-EXTRA_DIST += $(PYTHON_TESTS) tests/run_rootless_systemd.sh tests/tests_utils.py build-aux/git-version-gen src/libcrun/signals.perf src/libcrun/mount_flags.perf
+EXTRA_DIST += $(PYTHON_TESTS) tests/run_rootless_systemd.sh tests/tests_utils.py tests/tap.h build-aux/git-version-gen src/libcrun/signals.perf src/libcrun/mount_flags.perf
 BUILT_SOURCES = .version git-version.h
 
 CLEANFILES = crun.spec .version git-version.h $(LUACRUN_ROCKSPEC)
@@ -397,16 +417,6 @@ endif
 if ENABLE_KRUN
 man1_MANS += krun.1
 endif
-
-crun.1: $(abs_srcdir)/crun.1.md
-if HAVE_MD2MAN
-	$(MD2MAN) -in $(abs_srcdir)/crun.1.md -out crun.1
-endif HAVE_MD2MAN
-
-krun.1: $(abs_srcdir)/krun.1.md
-if HAVE_MD2MAN
-	$(MD2MAN) -in $(abs_srcdir)/krun.1.md -out krun.1
-endif HAVE_MD2MAN
 
 install-exec-hook:
 if ENABLE_KRUN
@@ -424,7 +434,11 @@ if ENABLE_WASM
 	rm -f $(DESTDIR)$(bindir)/crun-wasm$(EXEEXT)
 endif
 
-generate-man: crun.1 krun.1
+MD2MAN = go-md2man
+
+generate-man:
+	$(MD2MAN) -in $(srcdir)/crun.1.md -out $(srcdir)/crun.1
+	$(MD2MAN) -in $(srcdir)/krun.1.md -out $(srcdir)/krun.1
 
 sync:
 	(cd libocispec; git pull https://github.com/containers/libocispec main)
@@ -433,8 +447,8 @@ coverity:
 	$(MAKE) $(AM_MAKEFLAGS) -C libocispec
 	$(MAKE) $(AM_MAKEFLAGS) crun
 
-libcrun.rs: src/libcrun/container.h
-	bindgen src/libcrun/container.h -- -I$(abs_builddir) -I$(abs_builddir)/libocispec/src  > $@
+libcrun.rs: src/libcrun/libcrun.h
+	bindgen src/libcrun/libcrun.h -- -I$(abs_top_srcdir)/src  > $@
 
 generate-rust-bindings: libcrun.rs
 
@@ -445,21 +459,16 @@ generate-mount_flags.c: src/libcrun/mount_flags.perf
 	${GPERF} --lookup-function-name libcrun_mount_flag_in_word_set -m 100 -tCEG -S1 $< > src/libcrun/mount_flags.c
 
 clang-format:
-# do not format files that were copied into the source directory.
-	git ls-files contrib src tests | grep -E "\\.[hc]" | grep -v "blake3\|chroot_realpath.c\|cloned_binary.c\|signals.c\|mount_flags.c" | xargs clang-format -style=file -i
-
-# Only files with a .sh suffix: the extension-less scripts in build-aux are
-# imported from gnulib and are not ours to fix.
-LIST_SH_FILES = git ls-files '*.sh'
+	$(srcdir)/build-aux/c-files.sh clang-format -style=file -i
 
 shellcheck:
-	$(LIST_SH_FILES) | xargs shellcheck
+	$(srcdir)/build-aux/sh-files.sh shellcheck
 
 validate-keyring:
 	$(srcdir)/build-aux/keyring_validate.sh
 
 shfmt:
-	$(LIST_SH_FILES) | xargs shfmt -w
+	$(srcdir)/build-aux/sh-files.sh shfmt -w
 
 # Static analysis with cppcheck.  Files copied into the source tree are not
 # analyzed.  varFuncNullUB is suppressed since a bare NULL is used as the
@@ -590,4 +599,4 @@ clean-local: coverage-clean
 # Coverage targets must not run in parallel due to race conditions in .gcda file writes
 .NOTPARALLEL: coverage-reset coverage-check coverage-html coverage-xml coverage-summary coverage-multi-env
 
-.PHONY: check-no-openat2 check-systemd coverity sync generate-rust-bindings generate-signals.c generate-mount_flags.c clang-format shellcheck validate-keyring shfmt cppcheck coverage-clean coverage-reset coverage-check coverage-html coverage-xml coverage-summary coverage-multi-env
+.PHONY: check-no-openat2 check-systemd coverity generate-man sync generate-rust-bindings generate-signals.c generate-mount_flags.c clang-format shellcheck validate-keyring shfmt cppcheck coverage-clean coverage-reset coverage-check coverage-html coverage-xml coverage-summary coverage-multi-env

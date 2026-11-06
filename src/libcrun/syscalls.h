@@ -94,12 +94,22 @@
 #  define MOUNT_ATTR_NOSYMFOLLOW 0x00200000
 #endif
 
+#ifndef MS_NOSYMFOLLOW
+#  define MS_NOSYMFOLLOW 256
+#endif
+
 /* close_range flags */
 #ifndef CLOSE_RANGE_CLOEXEC
 #  define CLOSE_RANGE_CLOEXEC (1U << 2)
 #endif
 
 /* openat2 resolve flags */
+#ifndef RESOLVE_NO_MAGICLINKS
+#  define RESOLVE_NO_MAGICLINKS 0x02
+#endif
+#ifndef RESOLVE_NO_SYMLINKS
+#  define RESOLVE_NO_SYMLINKS 0x04
+#endif
 #ifndef RESOLVE_IN_ROOT
 #  define RESOLVE_IN_ROOT 0x10
 #endif
