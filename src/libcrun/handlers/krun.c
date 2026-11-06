@@ -85,7 +85,7 @@
 
 /* "krun" in ASCII. */
 #define KRUN_SSH_VSOCK_PORT 0x6b72756e
-/* This is in a mount namespace, not in the host filesystem. */
+/* This is in a mount namespace, not in the host file system. */
 #define KRUN_SSH_SOCK_FILE "/.krun_ssh.sock"
 
 #define FD_PAIR_PARENT 0
