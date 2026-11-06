@@ -679,7 +679,7 @@ libkrun_exec (void *cookie, libcrun_container_t *container, const char *pathname
 }
 
 static int
-libkrun_exec_ssh (void *cookie, libcrun_container_t *container,
+libkrun_exec_ssh (void *cookie arg_unused, libcrun_container_t *container,
                   const char *pathname arg_unused,
                   runtime_spec_schema_config_schema_process *process)
 {
