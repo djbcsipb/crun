@@ -66,7 +66,6 @@ BuildRequires: json-c-devel
 BuildRequires: libseccomp-devel
 BuildRequires: python3-libmount
 BuildRequires: libtool
-BuildRequires: protobuf-c-devel
 BuildRequires: criu-devel >= 3.17.1-2
 Recommends: criu >= 3.17.1
 Recommends: criu-libs
@@ -127,6 +126,7 @@ rm -rf %{buildroot}%{_prefix}/lib*
 %files
 %license COPYING
 %{_bindir}/%{name}
+%{_includedir}/libcrun.h
 %{_mandir}/man1/%{name}.1.gz
 
 %if %{defined krun_support}

@@ -37,7 +37,7 @@ logger = logging.getLogger('crun.tests')
 
 # Export logger for use in test files
 __all__ = ['logger', 'base_config', 'run_and_get_output', 'run_crun_command', 'run_crun_command_raw',
-           'parse_proc_status', 'add_all_namespaces', 'tests_main', 'is_rootless',
+           'parse_proc_status', 'add_all_namespaces', 'tests_main', 'is_rootless', 'is_openat2_available',
            'is_cgroup_v2_unified', 'is_sched_deadline_available', 'get_crun_feature_string', 'running_on_systemd',
            'systemctl_show',
            'get_tests_root', 'get_tests_root_status', 'get_init_path', 'get_crun_path',
@@ -330,9 +330,9 @@ def get_test_environment():
 def run_and_get_output(config, detach=False, preserve_fds=None, pid_file=None,
                        keep=False,
                        command='run', env=None, use_popen=False, hide_stderr=False, cgroup_manager=None,
-                       all_dev_null=False, stdin_dev_null=False, id_container=None, relative_config_path="config.json",
+                       all_dev_null=False, stdin_dev_null=False, id_container=None, relative_config_path=None,
                        chown_rootfs_to=None, callback_prepare_rootfs=None, debug=False,
-                       bundle_via_symlink=False):
+                       bundle_via_symlink=False, console_socket=None):
 
     # Some tests require that the container user, which might not be the
     # same user as the person running the tests, is able to resolve the full path
@@ -352,7 +352,7 @@ def run_and_get_output(config, detach=False, preserve_fds=None, pid_file=None,
     if id_container is None:
         id_container = 'test-%s' % os.path.basename(temp_dir)
 
-    config_path = os.path.join(temp_dir, relative_config_path)
+    config_path = os.path.join(temp_dir, relative_config_path or "config.json")
     config_dir = os.path.dirname(config_path)
     if not os.path.exists(config_dir):
         os.makedirs(config_dir)
@@ -402,15 +402,16 @@ def run_and_get_output(config, detach=False, preserve_fds=None, pid_file=None,
     keep_arg = ['--keep'] if keep else []
     preserve_fds_arg = ['--preserve-fds', str(preserve_fds)] if preserve_fds else []
     pid_file_arg = ['--pid-file', pid_file] if pid_file else []
-    relative_config_path = ['--config', relative_config_path] if relative_config_path else []
+    config_arg = ['--config', relative_config_path] if relative_config_path else []
     debug_arg = ['--debug'] if debug else []
+    console_socket_arg = ['--console-socket', console_socket] if console_socket else []
 
     # Use env var if cgroup_manager not explicitly specified
     if cgroup_manager is None:
         cgroup_manager = get_cgroup_manager()
 
     root = get_tests_root_status()
-    args = [crun] + debug_arg + ["--cgroup-manager", cgroup_manager, "--root", root, command] + bundle_arg + relative_config_path + preserve_fds_arg + detach_arg + keep_arg + pid_file_arg + [id_container]
+    args = [crun] + debug_arg + ["--cgroup-manager", cgroup_manager, "--root", root, command] + bundle_arg + config_arg + console_socket_arg + preserve_fds_arg + detach_arg + keep_arg + pid_file_arg + [id_container]
 
     stderr = subprocess.STDOUT
     if hide_stderr:
@@ -483,13 +484,15 @@ def wait_for_state(cid, states='running', timeout=5):
     """
     if isinstance(states, str):
         states = (states,)
-    status_file = os.path.join(get_tests_root_status(), cid, "status")
+    # Wait for the container state directory rather than a particular file
+    # in it, so as not to depend on how the runtime keeps the state.
+    state_dir = os.path.join(get_tests_root_status(), cid)
     args = [get_crun_path(), "--root", get_tests_root_status(), "state", cid]
     deadline = time.monotonic() + timeout
     while True:
         # Only ask crun once the container is known to it, as it logs an error
         # for every state command for a container which does not exist yet.
-        if os.path.exists(status_file):
+        if os.path.isdir(state_dir):
             r = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, close_fds=False)
             if r.returncode == 0:
                 state = json.loads(r.stdout)
@@ -545,6 +548,10 @@ def is_rootless():
         if "4294967295" in f.readline():
             return False
     return True
+
+def is_openat2_available():
+    """Check if openat2(2) works; it can be blocked by a seccomp filter, see tests/no_openat2."""
+    return subprocess.call([get_init_path(), "check-feature", "openat2"]) == 0
 
 def is_cgroup_v2_unified():
     return subprocess.check_output("stat -c%T -f /sys/fs/cgroup".split()).decode("utf-8").strip() == "cgroup2fs"

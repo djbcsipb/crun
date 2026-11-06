@@ -31,10 +31,10 @@ Exec a command in a running container.
 List known containers.
 
 **mounts add**
-Add mounts while the container is running.  It requires two arguments: the container ID and a JSON file containing the mounts section of the OCI config file.  Each mount listed there is added to the running container.  The command is experimental and can be changed without notice.
+Add mounts while the container is running.  It requires two arguments: the container ID and a JSON file containing the mounts section of the OCI config file.  Each mount listed there is added to the running container; symlinks in its destination path are not followed.  It fails if the container process has moved to a mount namespace that is not owned by the user namespace of the container.  The command is experimental and can be changed without notice.
 
 **mounts remove**
-Remove mounts while the container is running.  It requires two arguments: the container ID and a JSON file containing the mounts section of the OCI config file.  Only the destination attribute for each mount is used.  The command is experimental and can be changed without notice.
+Remove mounts while the container is running.  It requires two arguments: the container ID and a JSON file containing the mounts section of the OCI config file.  Only the destination attribute for each mount is used; symlinks in its path are not followed.  It fails if the container process has moved to a mount namespace that is not owned by the user namespace of the container.  The command is experimental and can be changed without notice.
 
 **kill**
 Send the specified signal to the container init process.  If no signal
@@ -113,7 +113,9 @@ Defines where to store the state for crun containers.
 
 **--systemd-cgroup**
 Use systemd for configuring cgroups.  If not specified, the cgroup is
-created directly using the cgroupfs backend.
+created directly using the cgroupfs backend.  Same as
+**--cgroup-manager**=**systemd**; it conflicts with any other
+**--cgroup-manager** value.
 
 **--cgroup-manager**=_MANAGER_
 Specify what cgroup manager must be used.  Permitted values are **cgroupfs**,
@@ -364,6 +366,24 @@ the pre-dump. It is important to use a relative path from the actual
 checkpoint directory specified via **--image-path**. It will fail
 if an absolute path is used.
 
+**--lazy-pages**
+Use the lazy migration mechanism: instead of saving the memory pages
+to the image, serve them from the page server (see **--page-server**)
+to a **criu lazy-pages** daemon, which in turn provides them on demand
+to the container restored with **restore --lazy-pages**. The checkpoint
+is completed once all memory pages are transferred. Requires libcriu
+with lazy pages support.
+
+**--page-server**=_ADDRESS_:_PORT_
+Address and port of the page server. With **--lazy-pages**, a page
+server is started, listening on this address and port. Otherwise, the
+memory pages are sent to a page server (**criu page-server**) running
+on this address and port.
+
+**--status-fd**=_FD_
+Write a zero byte to the file descriptor _FD_ once the page server is
+ready to serve memory pages. Requires **--lazy-pages**.
+
 **--manage-cgroups-mode**=_MODE_
 Specify which CRIU manage cgroup mode should be used. Permitted values are
 **soft**, **ignore**, **full** or **strict**. Default is **soft**.
@@ -400,6 +420,10 @@ Where to write the PID of the container
 Specify which CRIU manage cgroup mode should be used. Permitted values are
 **soft**, **ignore**, **full** or **strict**. Default is **soft**.
 
+**--lazy-pages**
+Restore the memory pages lazily, on demand, from a running
+**criu lazy-pages** daemon. See **checkpoint --lazy-pages**.
+
 **--lsm-profile**=_TYPE_:_NAME_
 Specify an LSM profile to be used during restore.
 _TYPE_ can be either **apparmor** or **selinux**.
@@ -410,6 +434,9 @@ This option replaces an existing mount context information
 with the specified value. This is useful when restoring
 a container into an existing Pod and selinux labels
 need to be changed during restore.
+
+**--no-new-keyring**
+Keep the same session key.
 
 # Extensions to OCI
 

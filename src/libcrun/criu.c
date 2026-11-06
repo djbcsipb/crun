@@ -36,6 +36,7 @@
 #  include "utils.h"
 #  include "cgroup.h"
 #  include "cgroup-utils.h"
+#  include "mount_flags.h"
 
 #  ifndef STATIC
 #    include <dlfcn.h>
@@ -57,7 +58,63 @@
 /* Defined in chroot_realpath.c  */
 char *chroot_realpath (const char *chroot, const char *path, char resolved_path[]);
 
+/* Map the public cgroups mode (enum libcrun_cr_cgroups_mode) onto the CRIU enum.  */
+static enum criu_cg_mode
+criu_cg_mode_from_public (int mode)
+{
+  switch (mode)
+    {
+    case LIBCRUN_CR_CG_MODE_IGNORE:
+      return CRIU_CG_MODE_IGNORE;
+    case LIBCRUN_CR_CG_MODE_FULL:
+      return CRIU_CG_MODE_FULL;
+    case LIBCRUN_CR_CG_MODE_STRICT:
+      return CRIU_CG_MODE_STRICT;
+    case LIBCRUN_CR_CG_MODE_DEFAULT:
+    case LIBCRUN_CR_CG_MODE_SOFT:
+    default:
+      /* Default to CRIU_CG_MODE_SOFT, just as runc.  */
+      return CRIU_CG_MODE_SOFT;
+    }
+}
+
+/* Map the public network lock method (enum libcrun_cr_network_lock_method) onto the
+   CRIU enum.  *LOCK is set to 0 when no explicit method must be set (CRIU default).
+   A method that this build cannot honor is an error, never a silent fallback to
+   the CRIU default.  */
+static int
+criu_network_lock_from_public (int method, int *lock, libcrun_error_t *err)
+{
+  switch (method)
+    {
+    case LIBCRUN_CR_NETWORK_LOCK_IPTABLES:
+      *lock = CRIU_NETWORK_LOCK_IPTABLES;
+      return 0;
+    case LIBCRUN_CR_NETWORK_LOCK_NFTABLES:
+      *lock = CRIU_NETWORK_LOCK_NFTABLES;
+      return 0;
+    case LIBCRUN_CR_NETWORK_LOCK_SKIP:
+#  if CRIU_NETWORK_LOCK_SKIP_SUPPORT
+      *lock = CRIU_NETWORK_LOCK_SKIP;
+      return 0;
+#  else
+      return crun_make_error (err, 0, "CRIU: the `skip` network lock method is not supported by this build");
+#  endif
+    case LIBCRUN_CR_NETWORK_LOCK_DEFAULT:
+      *lock = 0;
+      return 0;
+    default:
+      return crun_make_error (err, 0, "CRIU: unknown network lock method %d", method);
+    }
+}
+
 static const char *console_socket = NULL;
+static int status_fd = -1;
+
+/* The external mounts CRIU restores, and the flags the configuration asks
+   for each of them.  */
+static struct libcrun_mount_flags_s *restored_ext_mounts = NULL;
+static size_t n_restored_ext_mounts = 0;
 
 #  define LIBCRIU_MIN_VERSION 31500
 
@@ -71,6 +128,7 @@ struct libcriu_wrapper_s
   int (*criu_dump) (void);
   int (*criu_get_orphan_pts_master_fd) (void);
   int (*criu_init_opts) (void);
+  int (*criu_notify_pid) (criu_notify_arg_t na);
 #  ifdef CRIU_JOIN_NS_SUPPORT
   int (*criu_join_ns_add) (const char *ns, const char *ns_file, const char *extra_opt);
 #  endif
@@ -85,6 +143,7 @@ struct libcriu_wrapper_s
   int (*criu_set_log_file) (const char *log_file);
   void (*criu_set_log_level) (int log_level);
   void (*criu_set_leave_running) (bool leave_running);
+  void (*criu_set_lazy_pages) (bool lazy_pages);
   void (*criu_set_manage_cgroups) (bool manage);
   void (*criu_set_manage_cgroups_mode) (enum criu_cg_mode mode);
   int (*criu_set_network_lock) (enum criu_network_lock_method method);
@@ -92,6 +151,7 @@ struct libcriu_wrapper_s
   void (*criu_set_orphan_pts_master) (bool orphan_pts_master);
   void (*criu_set_images_dir_fd) (int fd);
   int (*criu_set_parent_images) (const char *path);
+  int (*criu_set_page_server_address_port) (const char *address, int port);
   void (*criu_set_pid) (int pid);
   int (*criu_set_root) (const char *root);
   int (*criu_add_cg_root) (const char *ctrl, const char *path);
@@ -122,6 +182,11 @@ cleanup_wrapper (void *p)
 #  endif
   free (*w);
   libcriu_wrapper = NULL;
+
+  while (n_restored_ext_mounts > 0)
+    free (restored_ext_mounts[--n_restored_ext_mounts].target);
+  free (restored_ext_mounts);
+  restored_ext_mounts = NULL;
 }
 
 #  define cleanup_wrapper __attribute__ ((cleanup (cleanup_wrapper)))
@@ -160,6 +225,7 @@ load_wrapper (struct libcriu_wrapper_s **wrapper_out, libcrun_error_t *err)
   LOAD_CRIU_FUNCTION (criu_dump, false);
   LOAD_CRIU_FUNCTION (criu_get_orphan_pts_master_fd, false);
   LOAD_CRIU_FUNCTION (criu_init_opts, false);
+  LOAD_CRIU_FUNCTION (criu_notify_pid, false);
 
 #  ifdef CRIU_JOIN_NS_SUPPORT
   /* criu_join_ns_add() API was introduced with CRIU version 3.16.1
@@ -180,6 +246,10 @@ load_wrapper (struct libcriu_wrapper_s **wrapper_out, libcrun_error_t *err)
   LOAD_CRIU_FUNCTION (criu_set_freeze_cgroup, false);
   LOAD_CRIU_FUNCTION (criu_set_images_dir_fd, false);
   LOAD_CRIU_FUNCTION (criu_set_leave_running, false);
+#  if ! defined STATIC || defined CRIU_LAZY_PAGES
+  /* criu_set_lazy_pages() is only available in newer libcriu versions.  */
+  LOAD_CRIU_FUNCTION (criu_set_lazy_pages, true);
+#  endif
   LOAD_CRIU_FUNCTION (criu_set_log_file, false);
   LOAD_CRIU_FUNCTION (criu_set_log_level, false);
   LOAD_CRIU_FUNCTION (criu_set_manage_cgroups, false);
@@ -188,6 +258,7 @@ load_wrapper (struct libcriu_wrapper_s **wrapper_out, libcrun_error_t *err)
   LOAD_CRIU_FUNCTION (criu_set_notify_cb, false);
   LOAD_CRIU_FUNCTION (criu_set_orphan_pts_master, false);
   LOAD_CRIU_FUNCTION (criu_set_parent_images, false);
+  LOAD_CRIU_FUNCTION (criu_set_page_server_address_port, false);
   LOAD_CRIU_FUNCTION (criu_set_pid, false);
   LOAD_CRIU_FUNCTION (criu_set_root, false);
   LOAD_CRIU_FUNCTION (criu_add_cg_root, false);
@@ -208,9 +279,38 @@ load_wrapper (struct libcriu_wrapper_s **wrapper_out, libcrun_error_t *err)
   return 0;
 }
 
-static int
-criu_notify (char *action, __attribute__ ((unused)) criu_notify_arg_t na)
+static void
+add_restored_ext_mount (const char *target, unsigned long flags)
 {
+  restored_ext_mounts = xrealloc (restored_ext_mounts, sizeof (*restored_ext_mounts) * (n_restored_ext_mounts + 1));
+  restored_ext_mounts[n_restored_ext_mounts].target = xstrdup (target);
+  restored_ext_mounts[n_restored_ext_mounts].flags = flags;
+  n_restored_ext_mounts++;
+}
+
+static int
+criu_notify (char *action, criu_notify_arg_t na)
+{
+  if (strcmp (action, "post-restore") == 0)
+    {
+      /* CRIU takes the source of an external mount from us and its flags
+       * from the image, i.e. from whatever mount was at that path in the
+       * container when it was checkpointed.  The container can move its
+       * mount points around, so before it is resumed make sure that each
+       * source is mounted with the restrictions the configuration asks for. */
+      libcrun_error_t tmp_err = NULL;
+      int ret;
+
+      ret = libcrun_restrict_mounts_in_container (libcriu_wrapper->criu_notify_pid (na), restored_ext_mounts,
+                                                  n_restored_ext_mounts, &tmp_err);
+      if (UNLIKELY (ret < 0))
+        {
+          libcrun_error (tmp_err->status, "cannot set the flags of the restored mounts: %s", tmp_err->msg);
+          libcrun_error_release (&tmp_err);
+          return ret;
+        }
+    }
+
   if (strncmp (action, "orphan-pts-master", 17) == 0)
     {
       /* CRIU sends us the master FD via the 'orphan-pts-master'
@@ -238,6 +338,19 @@ criu_notify (char *action, __attribute__ ((unused)) criu_notify_arg_t na)
           libcrun_error_release (&tmp_err);
           return ret;
         }
+    }
+  else if (strcmp (action, "status-ready") == 0 && status_fd >= 0)
+    {
+      /* CRIU is ready to serve memory pages to the lazy-pages daemon.
+       * Let the user know by writing a zero byte to the status fd. */
+      const char c = '\0';
+      ssize_t ret;
+
+      ret = TEMP_FAILURE_RETRY (write (status_fd, &c, 1));
+      close (status_fd);
+      status_fd = -1;
+      if (UNLIKELY (ret != 1))
+        return -1;
     }
   return 0;
 }
@@ -269,6 +382,32 @@ criu_check_mem_track (libcrun_error_t *err)
 }
 
 #  endif
+
+static int
+setup_lazy_pages (libcrun_error_t *err)
+{
+  if (libcriu_wrapper->criu_set_lazy_pages == NULL)
+    return crun_make_error (err, 0, "lazy pages are not supported by this libcriu version");
+
+#  ifdef CRIU_PRE_DUMP_SUPPORT
+  {
+    struct criu_feature_check features = { 0 };
+    int ret;
+
+    features.lazy_pages = true;
+
+    ret = libcriu_wrapper->criu_feature_check (&features, sizeof (features));
+    if (UNLIKELY (ret < 0))
+      return crun_make_error (err, 0, "CRIU feature checking failed: %d", ret);
+
+    if (! features.lazy_pages)
+      return crun_make_error (err, 0, "CRIU lazy pages not supported");
+  }
+#  endif
+
+  libcriu_wrapper->criu_set_lazy_pages (true);
+  return 0;
+}
 
 static int
 register_masked_paths_mounts (runtime_spec_schema_config_schema *def, libcrun_container_t *container,
@@ -305,6 +444,9 @@ register_masked_paths_mounts (runtime_spec_schema_config_schema *def, libcrun_co
           ret = libcriu_wrapper->criu_add_ext_mount (def->linux->masked_paths[i], empty_dir_path);
           if (UNLIKELY (ret < 0))
             return crun_make_error (err, -ret, "CRIU: failed adding external mount for masked directory `%s`", def->linux->masked_paths[i]);
+
+          if (is_restore)
+            add_restored_ext_mount (def->linux->masked_paths[i], MS_RDONLY);
         }
       else if (S_ISREG (statbuf.st_mode))
         {
@@ -312,6 +454,9 @@ register_masked_paths_mounts (runtime_spec_schema_config_schema *def, libcrun_co
           ret = libcriu_wrapper->criu_add_ext_mount (def->linux->masked_paths[i], bind_target);
           if (UNLIKELY (ret < 0))
             return crun_make_error (err, -ret, "CRIU: failed adding external mount to `%s`", bind_target);
+
+          if (is_restore)
+            add_restored_ext_mount (def->linux->masked_paths[i], MS_RDONLY);
         }
     }
 
@@ -518,13 +663,13 @@ static void
 show_criu_log (const char *work_path, const char *log)
 {
   cleanup_free char *log_path = NULL;
-  libcrun_error_t *tmp_err = NULL;
+  libcrun_error_t tmp_err = NULL;
   char line[1024];
   FILE *f;
 
-  if (UNLIKELY (append_paths (&log_path, tmp_err, work_path, log, NULL)) < 0)
+  if (UNLIKELY (append_paths (&log_path, &tmp_err, work_path, log, NULL) < 0))
     {
-      crun_error_release (tmp_err);
+      crun_error_release (&tmp_err);
       return;
     }
 
@@ -638,7 +783,9 @@ libcrun_container_checkpoint_linux_criu (libcrun_container_status_t *status, lib
 
   /* Set up logging. */
   libcriu_wrapper->criu_set_log_level (4);
-  libcriu_wrapper->criu_set_log_file (CRIU_CHECKPOINT_LOG_FILE);
+  ret = libcriu_wrapper->criu_set_log_file (CRIU_CHECKPOINT_LOG_FILE);
+  if (UNLIKELY (ret < 0))
+    return crun_make_error (err, -ret, "error setting CRIU log file to `%s`", CRIU_CHECKPOINT_LOG_FILE);
 
   /* Set up CRIU config file */
   if (UNLIKELY (handle_criu_config_file (container, err)))
@@ -653,6 +800,16 @@ libcrun_container_checkpoint_linux_criu (libcrun_container_status_t *status, lib
   ret = setup_criu_work_dir (cr_options, &work_fd, err);
   if (UNLIKELY (ret < 0))
     return ret;
+
+  if (cr_options->page_server_address != NULL)
+    {
+      ret = libcriu_wrapper->criu_set_page_server_address_port (cr_options->page_server_address,
+                                                                cr_options->page_server_port);
+      /* libcriu versions before criu_set_lazy_pages() was added always
+       * return -ENOMEM, so only check the result with a newer libcriu.  */
+      if (UNLIKELY (ret < 0 && libcriu_wrapper->criu_set_lazy_pages != NULL))
+        return crun_make_error (err, -ret, "CRIU: failed setting page server address");
+    }
 
 #  ifdef CRIU_PRE_DUMP_SUPPORT
 
@@ -847,19 +1004,49 @@ libcrun_container_checkpoint_linux_criu (libcrun_container_status_t *status, lib
   libcriu_wrapper->criu_set_tcp_established (cr_options->tcp_established);
   libcriu_wrapper->criu_set_file_locks (cr_options->file_locks);
   libcriu_wrapper->criu_set_orphan_pts_master (true);
-  if (cr_options->manage_cgroups_mode == -1)
-    /* Defaulting to CRIU_CG_MODE_SOFT just as runc */
-    libcriu_wrapper->criu_set_manage_cgroups_mode (CRIU_CG_MODE_SOFT);
-  else
-    libcriu_wrapper->criu_set_manage_cgroups_mode (cr_options->manage_cgroups_mode);
+  libcriu_wrapper->criu_set_manage_cgroups_mode (criu_cg_mode_from_public (cr_options->manage_cgroups_mode));
 
   libcriu_wrapper->criu_set_manage_cgroups (true);
 
-  if (libcriu_wrapper->criu_set_network_lock && cr_options->network_lock_method > 0)
+  if (libcriu_wrapper->criu_set_network_lock)
     {
-      ret = libcriu_wrapper->criu_set_network_lock (cr_options->network_lock_method);
+      int lock = 0;
+
+      ret = criu_network_lock_from_public (cr_options->network_lock_method, &lock, err);
       if (UNLIKELY (ret < 0))
-        return crun_make_error (err, 0, "CRIU: failed setting network lock");
+        return ret;
+
+      if (lock > 0)
+        {
+          ret = libcriu_wrapper->criu_set_network_lock (lock);
+          if (UNLIKELY (ret < 0))
+            return crun_make_error (err, 0, "CRIU: failed setting network lock");
+        }
+    }
+
+  if (cr_options->lazy_pages)
+    {
+      ret = setup_lazy_pages (err);
+      if (UNLIKELY (ret < 0))
+        return ret;
+    }
+
+  status_fd = -1;
+  if (cr_options->status_fd >= 0)
+    {
+      int flags;
+
+      if (UNLIKELY (! cr_options->lazy_pages))
+        return crun_make_error (err, 0, "status fd can only be used with lazy pages");
+
+      flags = fcntl (cr_options->status_fd, F_GETFL);
+      if (UNLIKELY (flags < 0))
+        return crun_make_error (err, errno, "invalid status fd `%d`", cr_options->status_fd);
+      if (UNLIKELY ((flags & O_ACCMODE) == O_RDONLY))
+        return crun_make_error (err, 0, "invalid status fd `%d`: not writable", cr_options->status_fd);
+
+      status_fd = cr_options->status_fd;
+      libcriu_wrapper->criu_set_notify_cb (criu_notify);
     }
 
   ret = libcriu_wrapper->criu_dump ();
@@ -1206,6 +1393,13 @@ libcrun_container_restore_linux_criu (libcrun_container_status_t *status, libcru
     json_object_put (doc);
   }
 
+  /* Our std streams are the new external descriptors, as CRIU connects the
+   * inherited pipes to them.  Record them now: once the container is
+   * restored it is already running, and /proc/PID/fd is under its control. */
+  ret = libcrun_save_external_descriptors (container, err);
+  if (UNLIKELY (ret < 0))
+    return ret;
+
   ret = setup_criu_work_dir (cr_options, &work_fd, err);
   if (UNLIKELY (ret < 0))
     return ret;
@@ -1240,6 +1434,8 @@ libcrun_container_restore_linux_criu (libcrun_container_status_t *status, libcru
           const char *dest_in_root;
           const char *source = def->mounts[i]->source;
           cleanup_free char *abs_source = NULL;
+          unsigned long flags = 0;
+          size_t j;
 
           if (nofollow)
             return crun_make_error (err, 0, "CRIU does not support `src-nofollow` for bind mounts");
@@ -1266,6 +1462,17 @@ libcrun_container_restore_linux_criu (libcrun_container_status_t *status, libcru
           ret = libcriu_wrapper->criu_add_ext_mount (dest_in_root, source);
           if (UNLIKELY (ret < 0))
             return crun_make_error (err, -ret, "CRIU: failed adding external mount to `%s`", source);
+
+          for (j = 0; j < def->mounts[i]->options_len; j++)
+            {
+              const struct propagation_flags_s *prop = NULL;
+
+              if (def->mounts[i]->options[j])
+                prop = libcrun_str2mount_flags (def->mounts[i]->options[j]);
+              if (prop && ! prop->clear)
+                flags |= prop->flags;
+            }
+          add_restored_ext_mount (dest_in_root, flags);
         }
     }
 
@@ -1429,6 +1636,13 @@ libcrun_container_restore_linux_criu (libcrun_container_status_t *status, libcru
   libcriu_wrapper->criu_set_file_locks (cr_options->file_locks);
   libcriu_wrapper->criu_set_orphan_pts_master (true);
 
+  if (cr_options->lazy_pages)
+    {
+      ret = setup_lazy_pages (err);
+      if (UNLIKELY (ret < 0))
+        goto out_umount;
+    }
+
   if (status->cgroup_path)
     {
       cgroup_mode = libcrun_get_cgroup_mode (err);
@@ -1454,20 +1668,25 @@ libcrun_container_restore_linux_criu (libcrun_container_status_t *status, libcru
         }
     }
 
-  if (cr_options->manage_cgroups_mode == -1)
-    /* Defaulting to CRIU_CG_MODE_SOFT just as runc */
-    libcriu_wrapper->criu_set_manage_cgroups_mode (CRIU_CG_MODE_SOFT);
-  else
-    libcriu_wrapper->criu_set_manage_cgroups_mode (cr_options->manage_cgroups_mode);
+  libcriu_wrapper->criu_set_manage_cgroups_mode (criu_cg_mode_from_public (cr_options->manage_cgroups_mode));
   libcriu_wrapper->criu_set_manage_cgroups (true);
 
-  if (libcriu_wrapper->criu_set_network_lock && cr_options->network_lock_method > 0)
+  if (libcriu_wrapper->criu_set_network_lock)
     {
-      ret = libcriu_wrapper->criu_set_network_lock (cr_options->network_lock_method);
+      int lock = 0;
+
+      ret = criu_network_lock_from_public (cr_options->network_lock_method, &lock, err);
       if (UNLIKELY (ret < 0))
+        goto out_umount;
+
+      if (lock > 0)
         {
-          ret = crun_make_error (err, 0, "CRIU: failed setting network lock");
-          goto out_umount;
+          ret = libcriu_wrapper->criu_set_network_lock (lock);
+          if (UNLIKELY (ret < 0))
+            {
+              ret = crun_make_error (err, 0, "CRIU: failed setting network lock");
+              goto out_umount;
+            }
         }
     }
 
@@ -1532,8 +1751,7 @@ libcrun_container_restore_linux_criu (libcrun_container_status_t *status, libcru
   /* Update the status struct with the newly allocated PID. This will
    * be necessary later when moving the process into its cgroup. */
   status->pid = ret;
-
-  ret = libcrun_save_external_descriptors (container, ret, err);
+  ret = 0;
 
 out_umount:
   ret_out = umount (root);

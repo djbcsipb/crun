@@ -232,6 +232,20 @@ xstrdup (const char *str)
   return ret;
 }
 
+static inline char *
+xstrndup (const char *str, size_t n)
+{
+  char *ret;
+  if (str == NULL)
+    return NULL;
+
+  ret = strndup (str, n);
+  if (ret == NULL)
+    OOM ();
+
+  return ret;
+}
+
 void consume_trailing_slashes (char *path);
 
 #define consume_slashes(t) \
@@ -272,12 +286,6 @@ write_file (const char *name, const void *data, size_t len, libcrun_error_t *err
   return write_file_at_with_flags (AT_FDCWD, WRITE_FILE_DEFAULT_FLAGS, 0700, name, data, len, err);
 }
 
-static inline int
-write_file_at (int dirfd, const char *name, const void *data, size_t len, libcrun_error_t *err)
-{
-  return write_file_at_with_flags (dirfd, WRITE_FILE_DEFAULT_FLAGS, 0700, name, data, len, err);
-}
-
 int crun_ensure_directory (const char *path, int mode, bool nofollow, libcrun_error_t *err);
 
 int crun_ensure_directory_at (int dirfd, const char *path, int mode, bool nofollow, libcrun_error_t *err);
@@ -307,6 +315,8 @@ int add_selinux_mount_label (char **ret, const char *data, const char *label, co
 int set_apparmor_profile (libcrun_container_t *container, const char *profile, bool no_new_privileges, bool now, libcrun_error_t *err);
 
 int read_all_fd_with_size_hint (int fd, const char *description, char **out, size_t *len, size_t hint, libcrun_error_t *err);
+
+int read_all_fd_with_max_size (int fd, const char *description, char **out, size_t *len, size_t max_size, libcrun_error_t *err);
 
 static inline int
 read_all_fd (int fd, const char *description, char **out, size_t *len, libcrun_error_t *err)
@@ -399,6 +409,8 @@ int get_file_type_at (int dirfd, mode_t *mode, bool nofollow, const char *path);
 
 int get_file_type (mode_t *mode, bool nofollow, const char *path);
 
+uint64_t get_mount_id (const char *path);
+
 int get_file_type_fd (int fd, mode_t *mode);
 
 char *get_user_name (uid_t uid);
@@ -465,9 +477,10 @@ path_has_dot_dot_component (const char *path)
 static inline int
 waitpid_ignore_stopped (pid_t pid, int *status, int options)
 {
-  int ret, s = 0;
+  int ret, s;
   do
     {
+      s = 0;
       ret = TEMP_FAILURE_RETRY (waitpid (pid, &s, options));
       if (ret < 0)
         return ret;
@@ -569,6 +582,13 @@ void channel_fd_pair_free (struct channel_fd_pair *channel);
  * and unregistered as necessary.
  */
 int channel_fd_pair_process (struct channel_fd_pair *channel, int epollfd, libcrun_error_t *err);
+
+/* Copy the data buffered in the channel_fd_pair, and the data currently
+ * available from the input file descriptor, to the output file descriptor.
+ * It is meant to be used once the writer to the input is gone, with the
+ * output file descriptor in blocking mode.
+ */
+int channel_fd_pair_flush (struct channel_fd_pair *channel, libcrun_error_t *err);
 
 static inline void
 cleanup_channel_fd_pairp (void *p)
