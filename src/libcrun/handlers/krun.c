@@ -26,6 +26,7 @@
 #include <sys/stat.h>
 #include <sys/socket.h>
 #include <errno.h>
+#include <stdint.h>
 #include <sys/mount.h>
 #include <sys/param.h>
 #include <sys/types.h>
@@ -686,7 +687,11 @@ libkrun_shell_quote (const char *arg)
   char *ret, *dest;
 
   for (p = arg; *p != '\0'; p++)
-    len += (*p == '\'') ? 4 : 1;
+    {
+      if (len > SIZE_MAX - 5)
+        error (EXIT_FAILURE, EOVERFLOW, "krun exec: argument too long");
+      len += (*p == '\'') ? 4 : 1;
+    }
 
   ret = xmalloc (len + 1);
   dest = ret;
@@ -707,9 +712,9 @@ libkrun_shell_quote (const char *arg)
 }
 
 static int
-libkrun_exec_ssh (void *cookie arg_unused, libcrun_container_t *container,
-                  const char *pathname arg_unused,
-                  runtime_spec_schema_config_schema_process *process)
+libkrun_exec_ssh_impl (libcrun_container_t *container,
+                       runtime_spec_schema_config_schema_process *process,
+                       bool raw_args)
 {
   cleanup_free char *sock_path = NULL;
   cleanup_free char *sock_addr = NULL;
@@ -786,9 +791,9 @@ libkrun_exec_ssh (void *cookie arg_unused, libcrun_container_t *container,
     }
   argv[i++] = sock_addr;
   // The guest shell splits the command line again, so each argument must be quoted.
-  // The internal control commands start with \x01 and are passed verbatim.
+  // Only the internal control commands sent by libkrun_kill_ssh are passed verbatim.
   for (j = 0; j < n; j++)
-    argv[i++] = (process->args[0][0] == '\x01') ? process->args[j] : libkrun_shell_quote (process->args[j]);
+    argv[i++] = raw_args ? process->args[j] : libkrun_shell_quote (process->args[j]);
   argv[i] = NULL;
 
   execvp ("ssh", argv);
@@ -797,7 +802,15 @@ libkrun_exec_ssh (void *cookie arg_unused, libcrun_container_t *container,
 }
 
 static int
-libkrun_kill_ssh (void *cookie, libcrun_container_t *container, pid_t pid, int signal, libcrun_error_t *err)
+libkrun_exec_ssh (void *cookie arg_unused, libcrun_container_t *container,
+                  const char *pathname arg_unused,
+                  runtime_spec_schema_config_schema_process *process)
+{
+  return libkrun_exec_ssh_impl (container, process, false);
+}
+
+static int
+libkrun_kill_ssh (void *cookie arg_unused, libcrun_container_t *container, pid_t pid, int signal, libcrun_error_t *err)
 {
   runtime_spec_schema_config_schema_process process = {
     0,
@@ -835,7 +848,7 @@ libkrun_kill_ssh (void *cookie, libcrun_container_t *container, pid_t pid, int s
           dup2 (devnull, STDOUT_FILENO);
           dup2 (devnull, STDERR_FILENO);
         }
-      libkrun_exec_ssh (cookie, container, NULL, &process);
+      libkrun_exec_ssh_impl (container, &process, true);
       _safe_exit (EXIT_FAILURE);
     }
 
