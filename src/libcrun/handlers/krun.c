@@ -678,6 +678,34 @@ libkrun_exec (void *cookie, libcrun_container_t *container, const char *pathname
   return ret;
 }
 
+static char *
+libkrun_shell_quote (const char *arg)
+{
+  size_t len = 2;
+  const char *p;
+  char *ret, *dest;
+
+  for (p = arg; *p != '\0'; p++)
+    len += (*p == '\'') ? 4 : 1;
+
+  ret = xmalloc (len + 1);
+  dest = ret;
+  *dest++ = '\'';
+  for (p = arg; *p != '\0'; p++)
+    {
+      if (*p == '\'')
+        {
+          memcpy (dest, "'\\''", 4);
+          dest += 4;
+        }
+      else
+        *dest++ = *p;
+    }
+  *dest++ = '\'';
+  *dest = '\0';
+  return ret;
+}
+
 static int
 libkrun_exec_ssh (void *cookie arg_unused, libcrun_container_t *container,
                   const char *pathname arg_unused,
@@ -757,8 +785,10 @@ libkrun_exec_ssh (void *cookie arg_unused, libcrun_container_t *container,
       argv[i++] = setenv_val;
     }
   argv[i++] = sock_addr;
+  // The guest shell splits the command line again, so each argument must be quoted.
+  // The internal control commands start with \x01 and are passed verbatim.
   for (j = 0; j < n; j++)
-    argv[i++] = process->args[j];
+    argv[i++] = (process->args[0][0] == '\x01') ? process->args[j] : libkrun_shell_quote (process->args[j]);
   argv[i] = NULL;
 
   execvp ("ssh", argv);
