@@ -86,7 +86,8 @@ def _get_cmdline(cid):
     return ""
 
 
-def run_cr_test(conf, before_checkpoint_cb=None, before_restore_cb=None, after_restore_cb=None):
+def run_cr_test(conf, before_checkpoint_cb=None, before_restore_cb=None, after_restore_cb=None,
+                callback_prepare_rootfs=None):
     cid = None
     cr_dir = os.path.join(get_tests_root(), 'checkpoint')
     work_dir = os.path.join(get_tests_root(), 'work-dir')
@@ -96,7 +97,8 @@ def run_cr_test(conf, before_checkpoint_cb=None, before_restore_cb=None, after_r
             conf,
             all_dev_null=True,
             use_popen=True,
-            detach=True
+            detach=True,
+            callback_prepare_rootfs=callback_prepare_rootfs
         )
         logger.info("run_cr_test: container started with id=%s", cid)
 
@@ -571,6 +573,49 @@ def test_cr():
     return run_cr_test(conf)
 
 
+def test_cr_userns():
+    if r := _check_cr_requirements():
+        return r
+
+    conf = base_config()
+    conf['process']['args'] = ['/init', 'pause']
+    add_all_namespaces(conf, userns=True, cgroupns=True)
+    conf['linux']['uidMappings'] = [{"containerID": 0, "hostID": 0, "size": 65536}]
+    conf['linux']['gidMappings'] = [{"containerID": 0, "hostID": 0, "size": 65536}]
+    return run_cr_test(conf)
+
+
+
+def test_cr_userns_devices():
+    if r := _check_cr_requirements():
+        return r
+
+    conf = base_config()
+    conf['process']['args'] = ['/init', 'pause']
+    add_all_namespaces(conf, userns=True, cgroupns=True)
+    conf['linux']['uidMappings'] = [{"containerID": 0, "hostID": 0, "size": 65536}]
+    conf['linux']['gidMappings'] = [{"containerID": 0, "hostID": 0, "size": 65536}]
+    devices = ['/dev/foo', '/dev/null']
+    conf['linux']['devices'] = [
+        {"path": path, "type": "c", "major": 1, "minor": 3, "uid": 10, "gid": 11, "fileMode": 0o600}
+        for path in devices
+    ]
+
+    def check_devices(cid):
+        s = wait_for_state(cid)
+        if s is None:
+            logger.info("test_cr_userns_devices: container %s is not running", cid)
+            return -1
+        for path in devices:
+            st = os.stat("/proc/%s/root%s" % (s['pid'], path))
+            if (st.st_uid, st.st_gid, st.st_mode & 0o7777) != (10, 11, 0o600):
+                logger.info("test_cr_userns_devices: %s is %d:%d %o after restore",
+                            path, st.st_uid, st.st_gid, st.st_mode & 0o7777)
+                return -1
+        return 0
+
+    return run_cr_test(conf, after_restore_cb=check_devices)
+
 def test_cr_masked_paths():
     if r := _check_cr_requirements():
         return r
@@ -734,6 +779,229 @@ def test_cr_mount_flags():
         if cid is not None:
             run_crun_command(["delete", "-f", cid])
     return 0
+
+
+# The mountpoints are recreated on restore in a rootfs that is under the
+# control of the container.  Nothing must be created in the source of a
+# read-only bind mount, as the container could not do it either.
+def test_cr_ro_bind_source_not_modified():
+    if r := _check_cr_requirements():
+        return r
+
+    cid = None
+    cr_dir = os.path.join(get_tests_root(), 'checkpoint-ro-bind-source')
+    work_dir = os.path.join(get_tests_root(), 'work-dir')
+    ro_dir = os.path.join(get_tests_root(), 'ro-bind-source-ro')
+    rw_file = os.path.join(get_tests_root(), 'ro-bind-source-rw')
+    os.makedirs(ro_dir)
+    open(rw_file, 'w').close()
+
+    conf = base_config()
+    conf['process']['args'] = ['/init', 'pause']
+    add_all_namespaces(conf, netns=False)
+    conf['mounts'] += [
+        {"destination": "/ro", "type": "bind", "source": ro_dir, "options": ["bind", "ro"]},
+        {"destination": "/a/data", "type": "bind", "source": rw_file, "options": ["bind", "rw"]},
+    ]
+
+    def prepare_rootfs(rootfs):
+        # Hidden by the read-only mount.
+        os.makedirs(os.path.join(rootfs, 'ro', 'dir'))
+        os.symlink('/b/data', os.path.join(rootfs, 'ro', 'dir', 'data'))
+
+    try:
+        _, cid = run_and_get_output(
+            conf,
+            all_dev_null=True,
+            use_popen=True,
+            detach=True,
+            callback_prepare_rootfs=prepare_rootfs
+        )
+
+        if wait_for_state(cid) is None:
+            logger.info("test_cr_ro_bind_source_not_modified: the container did not start")
+            return -1
+
+        run_crun_command([
+            "checkpoint",
+            "--image-path=%s" % cr_dir,
+            "--work-path=%s" % work_dir,
+            cid
+        ])
+
+        # A mountpoint cannot be renamed, its parent directory can, also from
+        # the container: move the second mount away, and make its destination
+        # a symlink to a path that does not exist in the read-only mount.
+        bundle = os.path.join(get_tests_root(), cid.split('-')[1])
+        rootfs = os.path.join(bundle, 'rootfs')
+        os.rename(os.path.join(rootfs, 'a'), os.path.join(rootfs, 'b'))
+        os.mkdir(os.path.join(rootfs, 'a'))
+        os.symlink('/ro/dir/data', os.path.join(rootfs, 'a', 'data'))
+
+        # The restore can fail, the mountpoint cannot be created.
+        try:
+            run_crun_command_raw([
+                "restore",
+                "-d",
+                "--image-path=%s" % cr_dir,
+                "--work-path=%s" % work_dir,
+                "--bundle=%s" % bundle,
+                cid
+            ])
+        except subprocess.CalledProcessError:
+            cid = None
+
+        content = os.listdir(ro_dir)
+        if content:
+            logger.info("test_cr_ro_bind_source_not_modified: created %s in the bind mount source", content)
+            return -1
+    finally:
+        if cid is not None:
+            run_crun_command(["delete", "-f", cid])
+    return 0
+
+
+# The key of an external mount is its destination as resolved in the
+# container, so the container chooses it.  CRIU stores it as "mnt[KEY]:VAL":
+# a key that has a meaning for CRIU must be refused, and so must the root.
+def test_cr_mount_invalid_key():
+    if r := _check_cr_requirements():
+        return r
+
+    cid = None
+    cr_dir = os.path.join(get_tests_root(), 'checkpoint-mount-invalid-key')
+    work_dir = os.path.join(get_tests_root(), 'work-dir')
+    source = os.path.join(get_tests_root(), 'mount-invalid-key')
+    os.makedirs(source, exist_ok=True)
+
+    conf = base_config()
+    conf['process']['args'] = ['/init', 'pause']
+    add_all_namespaces(conf)
+    conf['mounts'].append({"destination": "/a/data", "type": "bind", "source": source, "options": ["bind"]})
+
+    try:
+        _, cid = run_and_get_output(
+            conf,
+            all_dev_null=True,
+            use_popen=True,
+            detach=True
+        )
+
+        if wait_for_state(cid) is None:
+            logger.info("test_cr_mount_invalid_key: the container did not start")
+            return -1
+
+        # A mount point cannot be replaced, but its parent directory can,
+        # also from inside the container.  The destination is resolved in
+        # the running container, so the targets must exist there.
+        rootfs = os.path.join(get_tests_root(), cid.split('-')[1], 'rootfs')
+        os.rename(os.path.join(rootfs, 'a'), os.path.join(rootfs, 'b'))
+        os.mkdir(os.path.join(rootfs, 'a'))
+        os.makedirs(os.path.join(rootfs, 'b', 'data]:', 'name'))
+
+        for target in ("/b/data]:/name", "/"):
+            os.symlink(target, os.path.join(rootfs, 'a', 'data'))
+            try:
+                run_crun_command_raw([
+                    "checkpoint",
+                    "--image-path=%s" % cr_dir,
+                    "--work-path=%s" % work_dir,
+                    cid
+                ])
+                logger.info("test_cr_mount_invalid_key: checkpoint succeeded with `%s`", target)
+                return -1
+            except subprocess.CalledProcessError as e:
+                if b"invalid external mount destination" not in e.output:
+                    logger.info("test_cr_mount_invalid_key: unexpected error with `%s`: %s", target, e.output)
+                    return -1
+            os.unlink(os.path.join(rootfs, 'a', 'data'))
+    finally:
+        if cid is not None:
+            run_crun_command(["delete", "-f", cid])
+    return 0
+
+
+# Checkpoint and restore CONF with a bind mount to each destination in BINDS,
+# read-only if it is in READ_ONLY, and check that it is restored at the mount
+# point BINDS has for it.
+def _run_cr_binds_test(conf, binds, read_only=(), **kwargs):
+    sources = {}
+    for destination, mount_point in binds.items():
+        source = os.path.join(get_tests_root(), 'bind' + destination.replace('/', '-'))
+        os.makedirs(source, exist_ok=True)
+        sources[source] = mount_point
+        conf['mounts'].append({"destination": destination, "type": "bind", "source": source,
+                               "options": ["bind", "ro" if destination in read_only else "rw"]})
+
+    def check_mount_points(cid):
+        s = wait_for_state(cid)
+        if s is None:
+            logger.info("_run_cr_binds_test: container %s is not running", cid)
+            return -1
+        for source, mount_point in sources.items():
+            path = "/proc/%s/root%s" % (s['pid'], mount_point)
+            if not os.path.samestat(os.stat(source), os.stat(path)):
+                logger.info("_run_cr_binds_test: `%s` is not mounted at `%s`", source, mount_point)
+                return -1
+        return 0
+
+    return run_cr_test(conf, after_restore_cb=check_mount_points, **kwargs)
+
+
+# The root path is relative to the bundle and the destination goes through a
+# link in the rootfs, also to a tmpfs.
+def test_cr_bind_symlink():
+    if r := _check_cr_requirements():
+        return r
+
+    conf = base_config()
+    conf['process']['args'] = ['/init', 'pause']
+    add_all_namespaces(conf)
+    conf['mounts'].append({"destination": "/b", "type": "tmpfs", "source": "tmpfs", "options": ["rw"]})
+
+    def prepare_rootfs(rootfs):
+        for name in ['a', 'b']:
+            os.makedirs(os.path.join(rootfs, 'real-' + name))
+            os.symlink('real-' + name, os.path.join(rootfs, name))
+
+    return _run_cr_binds_test(conf, {'/a/data': '/real-a/data', '/b/data': '/real-b/data'},
+                              callback_prepare_rootfs=prepare_rootfs)
+
+
+# The destination goes through a link in another mount of the container.
+def _test_cr_bind_symlink_other_mount(read_only):
+    if r := _check_cr_requirements():
+        return r
+
+    conf = base_config()
+    conf['process']['args'] = ['/init', 'pause']
+    add_all_namespaces(conf)
+
+    # The mountpoint cannot be created in a read-only mount.
+    var = os.path.join(get_tests_root(), 'bind-var')
+    os.makedirs(os.path.join(var, 'real', 'data'))
+    os.symlink('real', os.path.join(var, 'link'))
+
+    # An absolute root path, so that only the other mount hides the link.
+    def prepare_rootfs(rootfs):
+        config_path = os.path.join(os.path.dirname(rootfs), 'config.json')
+        with open(config_path) as f:
+            config = json.load(f)
+        config['root']['path'] = rootfs
+        with open(config_path, 'w') as f:
+            json.dump(config, f)
+
+    return _run_cr_binds_test(conf, {'/var': '/var', '/var/link/data': '/var/real/data'},
+                              read_only=('/var',) if read_only else (),
+                              callback_prepare_rootfs=prepare_rootfs)
+
+
+def test_cr_bind_symlink_other_mount():
+    return _test_cr_bind_symlink_other_mount(False)
+
+
+def test_cr_bind_symlink_other_mount_ro():
+    return _test_cr_bind_symlink_other_mount(True)
 
 
 def test_cr_with_ext_ns():
@@ -952,10 +1220,17 @@ def test_cr_with_annotation_config():
 
 all_tests = {
     "checkpoint-restore": test_cr,
+    "checkpoint-restore-userns": test_cr_userns,
+    "checkpoint-restore-userns-devices": test_cr_userns_devices,
     "checkpoint-restore-masked-paths": test_cr_masked_paths,
     "checkpoint-restore-long-stdin-path": test_cr_long_stdin_path,
     "checkpoint-restore-exec-seccomp": test_cr_exec_seccomp,
     "checkpoint-restore-mount-flags": test_cr_mount_flags,
+    "checkpoint-restore-ro-bind-source-not-modified": test_cr_ro_bind_source_not_modified,
+    "checkpoint-restore-mount-invalid-key": test_cr_mount_invalid_key,
+    "checkpoint-restore-bind-symlink": test_cr_bind_symlink,
+    "checkpoint-restore-bind-symlink-other-mount": test_cr_bind_symlink_other_mount,
+    "checkpoint-restore-bind-symlink-other-mount-ro": test_cr_bind_symlink_other_mount_ro,
     "checkpoint-restore-ext-ns": test_cr_with_ext_ns,
     "checkpoint-restore-failed-cgroup-cleanup": test_cr_failed_restore_cgroup_cleanup,
     "checkpoint-restore-named-cgroup-hierarchy": test_cr_named_cgroup_hierarchy,

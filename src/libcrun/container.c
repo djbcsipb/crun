@@ -57,6 +57,8 @@
 #  include <sys/capability.h>
 #endif
 #include <sys/ioctl.h>
+#include <sys/file.h>
+#include <limits.h>
 #include <termios.h>
 #include <grp.h>
 #include <git-version.h>
@@ -1720,6 +1722,13 @@ container_init (void *args, char *notify_socket, int sync_socket, libcrun_error_
 
   crun_set_output_handler (log_write_to_stderr, NULL);
 
+  if (def->process && def->process->cpu_affinity)
+    {
+      ret = libcrun_set_cpu_affinity_from_string (0, def->process->cpu_affinity->start_container, err);
+      if (UNLIKELY (ret < 0))
+        return ret;
+    }
+
   if (def->process && def->process->no_new_privileges)
     {
       char **seccomp_flags = NULL;
@@ -1939,6 +1948,22 @@ has_new_pid_namespace (runtime_spec_schema_config_schema *def)
   return false;
 }
 
+bool
+has_user_namespace (runtime_spec_schema_config_schema *def)
+{
+  size_t i;
+
+  if (def->linux == NULL || def->linux->namespaces == NULL)
+    return false;
+
+  for (i = 0; i < def->linux->namespaces_len; i++)
+    {
+      if (strcmp (def->linux->namespaces[i]->type, "user") == 0)
+        return true;
+    }
+  return false;
+}
+
 static bool
 has_mount_namespace (runtime_spec_schema_config_schema *def)
 {
@@ -2010,7 +2035,7 @@ container_delete_internal (libcrun_context_t *context, libcrun_container_t *cont
 
               ret = run_poststop_hooks (context, container, def, &partial_status, state_root, id, err);
               if (UNLIKELY (ret < 0))
-                crun_error_write_warning_and_release (context->output_handler_arg, &err);
+                libcrun_error_report_and_release (err);
             }
 
           libcrun_container_delete_status (state_root, id, &tmp_err);
@@ -2989,7 +3014,7 @@ set_scheduler (pid_t pid, runtime_spec_schema_config_schema *def, libcrun_error_
   if (UNLIKELY (ret < 0))
     return ret;
 
-  ret = libcrun_reset_cpu_affinity_mask (pid, err);
+  ret = libcrun_set_cpu_affinity_or_reset (pid, def->process && def->process->cpu_affinity ? def->process->cpu_affinity->create_container : NULL, err);
   if (UNLIKELY (ret < 0))
     return ret;
 
@@ -3099,6 +3124,13 @@ libcrun_container_run_internal (libcrun_container_t *container, libcrun_context_
 
       if (cgroup_mode != CGROUP_MODE_UNIFIED)
         libcrun_warning ("cgroup v1 is deprecated and will be removed in a future release.  Use cgroup v2");
+    }
+
+  if (def->process && def->process->cpu_affinity)
+    {
+      ret = libcrun_set_cpu_affinity_from_string (0, def->process->cpu_affinity->create_runtime, err);
+      if (UNLIKELY (ret < 0))
+        return ret;
     }
 
   ret = setup_container_hooks_output (container, def, &container_args, &hooks_out_fd, &hooks_err_fd, err);
@@ -4480,14 +4512,21 @@ libcrun_container_exec_with_options (libcrun_context_t *context, const char *id,
   pipefd1 = container_ret_status[1];
 
   /* If the new process block doesn't specify a SELinux label, AppArmor profile, user,
-     I/O priority, scheduler or OOM score adjustment, then use the configuration from
-     the original config file.  */
+     I/O priority, scheduler, CPU affinity, OOM score adjustment or noNewPrivileges, then use the
+     configuration from the original config file.  */
   if (container->container_def->process)
     {
       if (process->io_priority == NULL && container->container_def->process->io_priority)
         {
           process->io_priority = clone_runtime_spec_schema_config_schema_process_io_priority (container->container_def->process->io_priority);
           if (process->io_priority == NULL)
+            OOM ();
+        }
+
+      if (process->cpu_affinity == NULL && process->exec_cpu_affinity == NULL && container->container_def->process->cpu_affinity)
+        {
+          process->cpu_affinity = clone_runtime_spec_schema_config_schema_process_cpu_affinity (container->container_def->process->cpu_affinity);
+          if (process->cpu_affinity == NULL)
             OOM ();
         }
 
@@ -4515,6 +4554,12 @@ libcrun_container_exec_with_options (libcrun_context_t *context, const char *id,
           process->user = clone_runtime_spec_schema_config_schema_process_user (container->container_def->process->user);
           if (process->user == NULL)
             OOM ();
+        }
+
+      if (! process->no_new_privileges_present && container->container_def->process->no_new_privileges)
+        {
+          process->no_new_privileges = true;
+          process->no_new_privileges_present = true;
         }
     }
 
@@ -4669,6 +4714,29 @@ libcrun_container_exec_with_options (libcrun_context_t *context, const char *id,
   return ret;
 }
 
+/* Take an exclusive lock on the state directory of the container, return the locked fd.  */
+static int
+lock_container_updates (const char *state_root, const char *id, libcrun_error_t *err)
+{
+  cleanup_free char *state_dir = NULL;
+  cleanup_close int dirfd = -1;
+  int ret;
+
+  ret = libcrun_get_state_directory (&state_dir, state_root, id, err);
+  if (UNLIKELY (ret < 0))
+    return ret;
+
+  dirfd = open (state_dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  if (UNLIKELY (dirfd < 0))
+    return crun_make_error (err, errno, "open `%s`", state_dir);
+
+  ret = TEMP_FAILURE_RETRY (flock (dirfd, LOCK_EX));
+  if (UNLIKELY (ret < 0))
+    return crun_make_error (err, errno, "flock `%s`", state_dir);
+
+  return get_and_reset (&dirfd);
+}
+
 int
 libcrun_container_update (libcrun_context_t *context, const char *id, const char *content, size_t len arg_unused,
                           libcrun_error_t *err)
@@ -4680,6 +4748,7 @@ libcrun_container_update (libcrun_context_t *context, const char *id, const char
   struct parser_context ctx = { 0, stderr };
   libcrun_container_status_t status = {};
   parser_error parser_err = NULL;
+  cleanup_close int dirfd = -1;
   json_object *doc = NULL;
   int ret;
 
@@ -4725,6 +4794,14 @@ libcrun_container_update (libcrun_context_t *context, const char *id, const char
                                                               err);
       if (UNLIKELY (ret < 0))
         goto cleanup;
+    }
+
+  /* The device rules can be read and written back by libcrun_container_add_device_rules.  */
+  dirfd = lock_container_updates (state_root, id, err);
+  if (UNLIKELY (dirfd < 0))
+    {
+      ret = dirfd;
+      goto cleanup;
     }
 
   ret = libcrun_linux_container_update (&status, state_root, resources, err);
@@ -4813,6 +4890,137 @@ libcrun_container_update_from_values (libcrun_context_t *context, const char *id
 
   json_gen_free (gen);
 
+  return ret;
+}
+
+static int
+parse_device_number (const char *s, int64_t *value, libcrun_error_t *err)
+{
+  unsigned long long v;
+  char *end;
+
+  if (s[0] < '0' || s[0] > '9')
+    return crun_make_error (err, 0, "invalid device number `%s`", s);
+
+  errno = 0;
+  v = strtoull (s, &end, 10);
+  if (*end != '\0' || errno != 0 || v > INT_MAX)
+    return crun_make_error (err, 0, "invalid device number `%s`", s);
+
+  *value = (int64_t) v;
+  return 0;
+}
+
+/* Parse a rule in the format "TYPE MAJOR:MINOR [ACCESS]".  */
+static int
+parse_device_rule (const struct libcrun_device_rule_s *rule, runtime_spec_schema_defs_linux_device_cgroup **out,
+                   libcrun_error_t *err)
+{
+  cleanup_free runtime_spec_schema_defs_linux_device_cgroup *dev = NULL;
+  cleanup_free char *copy = NULL;
+  char *type, *numbers, *access, *minor, *saveptr = NULL;
+  const char *it;
+  int ret;
+
+  if (rule->rule == NULL)
+    return crun_make_error (err, 0, "invalid device rule");
+
+  copy = xstrdup (rule->rule);
+  type = strtok_r (copy, " \t", &saveptr);
+  numbers = type ? strtok_r (NULL, " \t", &saveptr) : NULL;
+  access = numbers ? strtok_r (NULL, " \t", &saveptr) : NULL;
+  if (numbers == NULL || (access && strtok_r (NULL, " \t", &saveptr)))
+    return crun_make_error (err, 0, "invalid device rule `%s`: expected `TYPE MAJOR:MINOR [ACCESS]`", rule->rule);
+
+  if (strlen (type) != 1 || strchr ("abc", type[0]) == NULL)
+    return crun_make_error (err, 0, "invalid device rule `%s`: the type must be `a`, `b` or `c`", rule->rule);
+
+  minor = strchr (numbers, ':');
+  if (minor == NULL)
+    return crun_make_error (err, 0, "invalid device rule `%s`: expected `MAJOR:MINOR`", rule->rule);
+  *minor++ = '\0';
+
+  if (access == NULL)
+    access = "rwm";
+  if (access[0] == '\0')
+    return crun_make_error (err, 0, "invalid device rule `%s`: invalid access `%s`", rule->rule, access);
+  for (it = access; *it; it++)
+    if (strchr ("rwm", *it) == NULL || strchr (it + 1, *it) != NULL)
+      return crun_make_error (err, 0, "invalid device rule `%s`: invalid access `%s`", rule->rule, access);
+
+  dev = xmalloc0 (sizeof (*dev));
+
+  if (strcmp (numbers, "*") != 0)
+    {
+      ret = parse_device_number (numbers, &dev->major, err);
+      if (UNLIKELY (ret < 0))
+        return crun_error_wrap (err, "invalid device rule `%s`", rule->rule);
+      dev->major_present = 1;
+    }
+
+  if (strcmp (minor, "*") != 0)
+    {
+      ret = parse_device_number (minor, &dev->minor, err);
+      if (UNLIKELY (ret < 0))
+        return crun_error_wrap (err, "invalid device rule `%s`", rule->rule);
+      dev->minor_present = 1;
+    }
+
+  if (type[0] == 'a' && (dev->major_present || dev->minor_present))
+    return crun_make_error (err, 0, "invalid device rule `%s`: the type `a` requires `*:*`", rule->rule);
+
+  dev->allow = rule->allow;
+  dev->allow_present = 1;
+  dev->type = xstrdup (type);
+  dev->access = xstrdup (access);
+
+  *out = dev;
+  dev = NULL;
+  return 0;
+}
+
+int
+libcrun_container_add_device_rules (libcrun_context_t *context, const char *id,
+                                    const struct libcrun_device_rule_s *rules, size_t len, libcrun_error_t *err)
+{
+  cleanup_cgroup_status struct libcrun_cgroup_status *cgroup_status = NULL;
+  runtime_spec_schema_defs_linux_device_cgroup **devs = NULL;
+  const char *state_root = context->state_root;
+  libcrun_container_status_t status = {};
+  cleanup_close int dirfd = -1;
+  size_t i;
+  int ret;
+
+  devs = xmalloc0 ((len + 1) * sizeof (*devs));
+  for (i = 0; i < len; i++)
+    {
+      ret = parse_device_rule (&rules[i], &devs[i], err);
+      if (UNLIKELY (ret < 0))
+        goto exit;
+    }
+
+  ret = libcrun_read_container_status (&status, state_root, id, err);
+  if (UNLIKELY (ret < 0))
+    goto exit;
+
+  /* The rules are read and written back, serialize the updates of the same container.  */
+  dirfd = lock_container_updates (state_root, id, err);
+  if (UNLIKELY (dirfd < 0))
+    {
+      ret = dirfd;
+      goto exit;
+    }
+
+  cgroup_status = libcrun_cgroup_make_status (&status);
+
+  ret = libcrun_cgroup_add_device_rules (cgroup_status, devs, len, err);
+
+exit:
+  for (i = 0; i < len; i++)
+    if (devs[i])
+      free_runtime_spec_schema_defs_linux_device_cgroup (devs[i]);
+  free (devs);
+  libcrun_free_container_status (&status);
   return ret;
 }
 

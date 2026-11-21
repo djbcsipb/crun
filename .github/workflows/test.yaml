@@ -56,7 +56,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends autoconf automake libtool pkg-config
           ./autogen.sh
 
-      - uses: uraimo/run-on-arch-action@fa1f3e7de95534497266c7265950b5188355fbfb # v3.2.1
+      - uses: uraimo/run-on-arch-action@9893a0f995e5148dcc313ba661820f3992cffcc1 # v3.3
         name: Build
         id: build
         with:
@@ -160,7 +160,7 @@ jobs:
         with:
           repository: opencontainers/runc
           # Update along with tests/runc-integration-skip.txt.
-          ref: 642809e5e24b8ddad48ed64085cf33b226befd8f # v1.6.0-rc.1-99-g642809e5
+          ref: 817ee95c66f78831b8f57c7bc3185c230240f648 # v1.6.0-rc.1-116-g817ee95c
           path: runc
           persist-credentials: false
 
@@ -178,7 +178,7 @@ jobs:
           sudo apt-get install -q -y criu libcriu-dev automake libtool autotools-dev libseccomp-dev git make libcap-dev pkg-config gcc libsystemd-dev gperf libjson-c-dev libprotobuf-c-dev mawk sshfs uidmap
 
       - name: install bats
-        uses: bats-core/bats-action@77d6fb60505b4d0d1d73e48bd035b55074bbfb43 # 4.0.0
+        uses: bats-core/bats-action@3566550e0f594451ac0f58fcbfdeca93aa29a45e # 4.1.0
         with:
           bats-version: 1.12.0
           support-install: false
@@ -251,7 +251,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: zizmorcore/zizmor-action@53290badfa369cb0bf7ad16342cb62c2fa47ac7b # v0.8.0
+      - uses: zizmorcore/zizmor-action@45d7276c9ca790aabd705e31ca99c6185c3e76dd # v0.8.1
         with:
           version: 1.30.1
           advanced-security: false
