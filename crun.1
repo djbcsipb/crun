@@ -35,11 +35,11 @@ List known containers.
 
 .PP
 \fBmounts add\fP
-Add mounts while the container is running.  It requires two arguments: the container ID and a JSON file containing the mounts section of the OCI config file.  Each mount listed there is added to the running container.  The command is experimental and can be changed without notice.
+Add mounts while the container is running.  It requires two arguments: the container ID and a JSON file containing the mounts section of the OCI config file.  Each mount listed there is added to the running container; symlinks in its destination path are not followed.  It fails if the container process has moved to a mount namespace that is not owned by the user namespace of the container.  The command is experimental and can be changed without notice.
 
 .PP
 \fBmounts remove\fP
-Remove mounts while the container is running.  It requires two arguments: the container ID and a JSON file containing the mounts section of the OCI config file.  Only the destination attribute for each mount is used.  The command is experimental and can be changed without notice.
+Remove mounts while the container is running.  It requires two arguments: the container ID and a JSON file containing the mounts section of the OCI config file.  Only the destination attribute for each mount is used; symlinks in its path are not followed.  It fails if the container process has moved to a mount namespace that is not owned by the user namespace of the container.  The command is experimental and can be changed without notice.
 
 .PP
 \fBkill\fP
@@ -140,7 +140,9 @@ Defines where to store the state for crun containers.
 .PP
 \fB--systemd-cgroup\fP
 Use systemd for configuring cgroups.  If not specified, the cgroup is
-created directly using the cgroupfs backend.
+created directly using the cgroupfs backend.  Same as
+\fB--cgroup-manager\fP=\fBsystemd\fP; it conflicts with any other
+\fB--cgroup-manager\fP value.
 
 .PP
 \fB--cgroup-manager\fP=\fIMANAGER\fP
@@ -342,6 +344,21 @@ Generate a config.json file that is usable by an unprivileged user.
 crun [global options] update [options] CONTAINER
 
 .PP
+\fB--add-device\fP=\fIRULE\fP
+Allow access to a device.  \fIRULE\fP is "\fITYPE\fP \fIMAJOR\fP:\fIMINOR\fP [\fIACCESS\fP]", where
+\fITYPE\fP is \fBc\fP (character device), \fBb\fP (block device) or \fBa\fP (all
+devices), \fIMAJOR\fP and \fIMINOR\fP are numbers or \fB*\fP, and \fIACCESS\fP is a
+combination of \fBr\fP (read), \fBw\fP (write) and \fBm\fP (mknod), \fBrwm\fP by
+default.  The type \fBa\fP must be used with \fB*:*\fP\&.  The rule is added in
+front of the current device access list of the container, so it has a higher
+priority than the rules already there.  The option can be repeated and mixed
+with \fB--remove-device\fP, the last rule has the highest priority.  The rules are applied after the resources
+specified with \fB--resources\fP\&.  It is supported only with cgroup v2, when the
+container is not rootless and its eBPF device filter was installed by this
+version of crun.  The change is not stored in the container configuration, and
+it is lost if the container is restarted.
+
+.PP
 \fB--blkio-weight\fP=\fIVALUE\fP
 Specifies per cgroup weight.
 
@@ -398,6 +415,12 @@ Total memory usage.
 Maximum number of pids allowed in the container.
 
 .PP
+\fB--remove-device\fP=\fIRULE\fP
+Deny access to a device.  \fIRULE\fP has the same format as for
+\fB--add-device\fP, and the same conditions apply.  The default devices,
+e.g. \fI/dev/null\fP, are always accessible.
+
+.PP
 \fB-r\fP, \fB--resources\fP=\fIFILE\fP
 Path to the file containing the resources to update.
 
@@ -446,6 +469,27 @@ checkpoint directory specified via \fB--image-path\fP\&. It will fail
 if an absolute path is used.
 
 .PP
+\fB--lazy-pages\fP
+Use the lazy migration mechanism: instead of saving the memory pages
+to the image, serve them from the page server (see \fB--page-server\fP)
+to a \fBcriu lazy-pages\fP daemon, which in turn provides them on demand
+to the container restored with \fBrestore --lazy-pages\fP\&. The checkpoint
+is completed once all memory pages are transferred. Requires libcriu
+with lazy pages support.
+
+.PP
+\fB--page-server\fP=\fIADDRESS\fP:\fIPORT\fP
+Address and port of the page server. With \fB--lazy-pages\fP, a page
+server is started, listening on this address and port. Otherwise, the
+memory pages are sent to a page server (\fBcriu page-server\fP) running
+on this address and port.
+
+.PP
+\fB--status-fd\fP=\fIFD\fP
+Write a zero byte to the file descriptor \fIFD\fP once the page server is
+ready to serve memory pages. Requires \fB--lazy-pages\fP\&.
+
+.PP
 \fB--manage-cgroups-mode\fP=\fIMODE\fP
 Specify which CRIU manage cgroup mode should be used. Permitted values are
 \fBsoft\fP, \fBignore\fP, \fBfull\fP or \fBstrict\fP\&. Default is \fBsoft\fP\&.
@@ -491,6 +535,11 @@ Specify which CRIU manage cgroup mode should be used. Permitted values are
 \fBsoft\fP, \fBignore\fP, \fBfull\fP or \fBstrict\fP\&. Default is \fBsoft\fP\&.
 
 .PP
+\fB--lazy-pages\fP
+Restore the memory pages lazily, on demand, from a running
+\fBcriu lazy-pages\fP daemon. See \fBcheckpoint --lazy-pages\fP\&.
+
+.PP
 \fB--lsm-profile\fP=\fITYPE\fP:\fINAME\fP
 Specify an LSM profile to be used during restore.
 \fITYPE\fP can be either \fBapparmor\fP or \fBselinux\fP\&.
@@ -502,6 +551,10 @@ This option replaces an existing mount context information
 with the specified value. This is useful when restoring
 a container into an existing Pod and selinux labels
 need to be changed during restore.
+
+.PP
+\fB--no-new-keyring\fP
+Keep the same session key.
 
 
 .SH Extensions to OCI

@@ -52,6 +52,9 @@
 #  define CGROUP_WEIGHT_DEFAULT ((uint64_t) 100)
 #  define CGROUP_WEIGHT_MAX ((uint64_t) 10000)
 
+/* The CPU quota period used by the kernel (and systemd) by default, in us.  */
+#  define DEFAULT_CPU_QUOTA_PERIOD ((uint64_t) 100000)
+
 #  define SYSTEMD_MISSING_PROPERTIES_DIR ".cache/systemd-missing-properties"
 
 #  define IS_WILDCARD(x) (x <= 0)
@@ -135,10 +138,7 @@ get_systemd_scope_and_slice (const char *id, bool user_slice, const char *cgroup
     }
   if (slice)
     {
-      *slice = xstrdup (cgroup_path);
-      p = strchr (*slice, ':');
-      if (p)
-        *p = '\0';
+      *slice = xstrndup (cgroup_path, strcspn (cgroup_path, ":"));
 
       /* Ref: https://github.com/opencontainers/runc/blob/main/docs/systemd.md#systemd-unit-name-and-placement */
       if (is_empty_string (*slice))
@@ -235,7 +235,7 @@ setup_missing_cpu_options_for_systemd (runtime_spec_schema_config_linux_resource
   if (resources == NULL || resources->cpu == NULL)
     return 0;
 
-  if (! resources->cpu->burst_present)
+  if (! resources->cpu->burst_present && ! (cgroup2 && resources->cpu->idle_present))
     return 0;
 
   for (parent = 0; parent < 2; parent++)
@@ -256,6 +256,14 @@ setup_missing_cpu_options_for_systemd (runtime_spec_schema_config_linux_resource
       ret = write_cpu_burst (dirfd, cgroup2, resources->cpu, err);
       if (UNLIKELY (ret < 0))
         return ret;
+
+      /* cpu.idle can be set by systemd (via CPUWeight=0), but not reset.  */
+      if (cgroup2)
+        {
+          ret = write_cpu_idle (dirfd, resources->cpu, err);
+          if (UNLIKELY (ret < 0))
+            return ret;
+        }
     }
 
   return 0;
@@ -629,6 +637,36 @@ append_systemd_annotation (sd_bus_message *m, const char *name, size_t name_len,
       name = tmp_name;
     }
 
+  /* A *USec property is always an uint64, so, like runc does, accept any
+     number of seconds (possibly with a fractional part, and with an
+     optional integer type), and convert it to uint64 microseconds.  */
+  if (factor != 1)
+    {
+      static const char *types[] = { "uint64 ", "int64 ", "uint32 ", "int32 ", NULL };
+      const char *num = it;
+      char *endptr = NULL;
+      double v;
+      size_t i;
+
+      for (i = 0; types[i]; i++)
+        if (has_prefix (num, types[i]))
+          {
+            num += strlen (types[i]);
+            break;
+          }
+
+      errno = 0;
+      v = strtod (num, &endptr);
+      if (UNLIKELY (errno != 0 || endptr == num || *endptr || v < 0 || v * factor >= 18446744073709551615.0))
+        return crun_make_error (err, errno, "invalid value for `%s`: `%s`", name, value);
+
+      sd_err = sd_bus_message_append (m, "(sv)", name, "t", (uint64_t) (v * factor));
+      if (UNLIKELY (sd_err < 0))
+        return crun_make_error (err, -sd_err, "sd-bus message append `%s`", name);
+
+      return 0;
+    }
+
   if ((strcmp (it, "true") == 0) || (strcmp (it, "false") == 0))
     {
       bool b = *it == 't';
@@ -806,6 +844,20 @@ open_sd_bus_connection (sd_bus **bus, libcrun_error_t *err)
   return 0;
 }
 
+static const char *
+get_string_from_unified_map (runtime_spec_schema_config_linux_resources *resources, const char *name)
+{
+  size_t i;
+
+  if (resources == NULL || resources->unified == NULL)
+    return NULL;
+
+  for (i = 0; i < resources->unified->len; i++)
+    if (strcmp (resources->unified->keys[i], name) == 0)
+      return resources->unified->values[i];
+  return NULL;
+}
+
 static int
 get_value_from_unified_map (runtime_spec_schema_config_linux_resources *resources, const char *name,
                             uint64_t *value, libcrun_error_t *err)
@@ -879,7 +931,25 @@ get_memory_swap_max (runtime_spec_schema_config_linux_resources *resources, uint
 {
   if (resources->memory && resources->memory->swap_present)
     {
-      *limit = resources->memory->swap;
+      runtime_spec_schema_config_linux_resources_memory *memory = resources->memory;
+      int64_t mem = memory->limit_present ? memory->limit : 0;
+
+      /* The OCI swap limit is for memory+swap, while MemorySwapMax is for
+         swap only, so convert it, like it is done for memory.swap.max.  */
+      if (memory->swap == -1 || (mem == -1 && memory->swap == 0))
+        {
+          *limit = UINT64_MAX;
+          return 1;
+        }
+      /* 0 means unset.  */
+      if (memory->swap == 0)
+        return 0;
+      if (mem <= 0)
+        return crun_make_error (err, 0, "cannot set swap limit without the memory limit");
+      if (memory->swap < mem)
+        return crun_make_error (err, 0, "cannot set memory+swap limit less than the memory limit");
+
+      *limit = memory->swap - mem;
       return 1;
     }
 
@@ -898,6 +968,20 @@ get_cpu_weight (runtime_spec_schema_config_linux_resources *resources, uint64_t 
     return ret;
   if (ret > 0 && value == 1)
     has_idle = true;
+  if (resources->cpu && resources->cpu->idle_present && resources->cpu->idle == 1)
+    has_idle = true;
+
+  /* The unified map takes precedence, like with the cgroupfs driver.  */
+  ret = get_value_from_unified_map (resources, "cpu.weight", weight, err);
+  if (UNLIKELY (ret < 0))
+    return ret;
+  if (ret > 0)
+    {
+      if (has_idle)
+        return crun_make_error (err, 0, "cannot set both `cpu.idle` and `cpu.weight`");
+
+      return 1;
+    }
 
   if (resources->cpu && resources->cpu->shares_present)
     {
@@ -908,17 +992,6 @@ get_cpu_weight (runtime_spec_schema_config_linux_resources *resources, uint64_t 
       if (resources->cpu->shares == 0)
         return 0;
       *weight = convert_shares_to_weight (resources->cpu->shares);
-      return 1;
-    }
-
-  ret = get_value_from_unified_map (resources, "cpu.weight", weight, err);
-  if (UNLIKELY (ret < 0))
-    return ret;
-  if (ret > 0)
-    {
-      if (has_idle)
-        return crun_make_error (err, 0, "cannot set both `cpu.idle` and `cpu.weight`");
-
       return 1;
     }
   if (has_idle)
@@ -992,7 +1065,7 @@ append_io_weight (sd_bus_message *m, char **missing_properties, runtime_spec_sch
       char name[64];
       int len;
 
-      len = snprintf (name, sizeof (name), "%" PRIu64 ":%" PRIu64,
+      len = snprintf (name, sizeof (name), "/dev/block/%" PRIu64 ":%" PRIu64,
                       resources->block_io->weight_device[i]->major,
                       resources->block_io->weight_device[i]->minor);
       if (UNLIKELY (len >= (int) sizeof (name)))
@@ -1403,6 +1476,24 @@ bpfprog_path_from_scope (char **path, const char *scope, libcrun_error_t *err)
   return append_paths (path, err, CRUN_BPF_DIR, flat_scope, NULL);
 }
 
+/* Best effort.  */
+static void
+remove_bpf_program (const char *scope)
+{
+  cleanup_free char *path = NULL;
+  libcrun_error_t tmp_err = NULL;
+  int ret;
+
+  ret = bpfprog_path_from_scope (&path, scope, &tmp_err);
+  if (UNLIKELY (ret < 0))
+    {
+      crun_error_release (&tmp_err);
+      return;
+    }
+
+  unlink (path);
+}
+
 static int
 add_bpf_program (sd_bus_message *m,
                  bool is_update,
@@ -1410,6 +1501,7 @@ add_bpf_program (sd_bus_message *m,
                  char **missing_properties,
                  const char *scope,
                  bool *devices_set,
+                 bool *devices_map,
                  libcrun_error_t *err)
 {
   int ret = 0;
@@ -1419,6 +1511,7 @@ add_bpf_program (sd_bus_message *m,
   cleanup_free char *path = NULL;
 
   *devices_set = false;
+  *devices_map = false;
 
   /* Only root in the initial user namespace can pin a bpf program. */
   if (getuid () != 0 || ! has_bpf_fs () || property_missing_p (missing_properties, property_name))
@@ -1431,86 +1524,100 @@ add_bpf_program (sd_bus_message *m,
   if (in_userns)
     return 0;
 
-  program = create_dev_bpf (resources->devices, resources->devices_len, err);
-  if (UNLIKELY (program == NULL))
+  /* The rules are replaced in the map by the caller once the scope is updated, the program is not changed.  */
+  if (is_update)
     {
-      crun_error_release (err);
+      *devices_set = true;
       return 0;
     }
 
-  ret = bpfprog_path_from_scope (&path, scope, err);
+  /* The program is shared by all the containers, the rules are set on the scope after it is created.  */
+  ret = libcrun_ebpf_devices_pin (resources->devices, resources->devices_len, &path, err);
   if (UNLIKELY (ret < 0))
     return ret;
 
-  ret = mkdir (CRUN_BPF_DIR, 0700);
-  if (UNLIKELY (ret < 0 && errno != EEXIST))
-    return crun_make_error (err, errno, "mkdir " CRUN_BPF_DIR);
+  *devices_map = ret == 0;
 
-  if (is_update)
+  if (ret > 0)
     {
-      cleanup_free struct bpf_program *program_loaded = NULL;
-
-      if (resources->devices == NULL || resources->devices_len == 0)
+      program = create_dev_bpf (resources->devices, resources->devices_len, err);
+      if (UNLIKELY (program == NULL))
         {
-          *devices_set = true;
+          crun_error_release (err);
           return 0;
         }
 
-      ret = libcrun_ebpf_read_program (&program_loaded, path, err);
+      ret = bpfprog_path_from_scope (&path, scope, err);
       if (UNLIKELY (ret < 0))
         return ret;
 
-      /* it is the same as the loaded program.  */
-      if (libcrun_ebpf_cmp_programs (program, program_loaded))
-        {
-          *devices_set = true;
-          return 0;
-        }
+      ret = mkdir (CRUN_BPF_DIR, 0700);
+      if (UNLIKELY (ret < 0 && errno != EEXIST))
+        return crun_make_error (err, errno, "mkdir " CRUN_BPF_DIR);
 
-      /* Some platforms (e.g. ppc64) modify an EBPF program as it is
-       * loaded into the kernel, so in order to compare we actually
-       * have to load the new program and read it back. Seems ugly,
-       * but all this comes from the inability of systemd to modify
-       * the BPFProgram property.
-       */
-      {
-        cleanup_free struct bpf_program *program_new = NULL;
-        char tmp[64];
-        int len;
-
-        /* A unique name, as container name can't start with a digit. */
-        len = snprintf (tmp, sizeof (tmp), "%s/%d", CRUN_BPF_DIR, getpid ());
-        if (UNLIKELY (len >= (int) sizeof (tmp)))
-          return crun_make_error (err, 0, "internal error: static buffer too small");
-
-        ret = libcrun_ebpf_load (program, -1, tmp, err);
-        if (UNLIKELY (ret < 0))
-          return ret;
-
-        ret = libcrun_ebpf_read_program (&program_new, tmp, err);
-        unlink (tmp);
-        if (UNLIKELY (ret < 0))
-          return ret;
-
-        if (libcrun_ebpf_cmp_programs (program_new, program_loaded))
-          {
-            *devices_set = true;
-            return 0;
-          }
-      }
-
-      return crun_make_error (err, 0, "updating device access list not supported when using BPFProgram");
+      ret = libcrun_ebpf_load (program, -1, path, err);
+      if (UNLIKELY (ret < 0))
+        return ret;
     }
-
-  ret = libcrun_ebpf_load (program, -1, path, err);
-  if (UNLIKELY (ret < 0))
-    return ret;
 
   sd_err = sd_bus_message_append (m, "(sv)", property_name, "a(ss)", 1, "device", path);
   if (UNLIKELY (sd_err < 0))
     return crun_make_error (err, -sd_err, "sd-bus message append BPFProgram");
 
   *devices_set = true;
+
+  return 0;
+}
+
+/* Append CPUQuotaPeriodUSec and CPUQuotaPerSecUSec, the way runc does.  */
+static int
+append_cpu_quota (sd_bus_message *m, char **missing_properties,
+                  runtime_spec_schema_config_linux_resources *resources, libcrun_error_t *err)
+{
+  uint64_t period = (resources->cpu && resources->cpu->period_present) ? resources->cpu->period : 0;
+  int64_t quota = (resources->cpu && resources->cpu->quota_present) ? resources->cpu->quota : 0;
+  const char *cpu_max = get_string_from_unified_map (resources, "cpu.max");
+  int sd_err;
+
+  /* The unified map takes precedence, like with the cgroupfs driver.  */
+  if (cpu_max)
+    {
+      uint64_t max_period;
+      bool has_period;
+      int ret;
+
+      ret = parse_cpu_max (cpu_max, &quota, &max_period, &has_period, err);
+      if (UNLIKELY (ret < 0))
+        return ret;
+      if (has_period)
+        period = max_period;
+    }
+
+  if (period && ! property_missing_p (missing_properties, "CPUQuotaPeriodUSec"))
+    {
+      sd_err = sd_bus_message_append (m, "(sv)", "CPUQuotaPeriodUSec", "t", period);
+      if (UNLIKELY (sd_err < 0))
+        return crun_make_error (err, -sd_err, "sd-bus message append CPUQuotaPeriodUSec");
+    }
+
+  if ((quota != 0 || period) && ! property_missing_p (missing_properties, "CPUQuotaPerSecUSec"))
+    {
+      /* USEC_INFINITY in systemd.  */
+      uint64_t quota_per_sec = UINT64_MAX;
+
+      if (quota > 0)
+        {
+          quota_per_sec = ((uint64_t) quota * 1000000) / (period ? period : DEFAULT_CPU_QUOTA_PERIOD);
+          /* systemd converts CPUQuotaPerSecUSec to a percentage of CPU, so round it
+             up to the next 10ms, to not give the container less than it asked for.  */
+          if (quota_per_sec % 10000)
+            quota_per_sec = ((quota_per_sec / 10000) + 1) * 10000;
+        }
+
+      sd_err = sd_bus_message_append (m, "(sv)", "CPUQuotaPerSecUSec", "t", quota_per_sec);
+      if (UNLIKELY (sd_err < 0))
+        return crun_make_error (err, -sd_err, "sd-bus message append CPUQuotaPerSecUSec");
+    }
 
   return 0;
 }
@@ -1523,6 +1630,7 @@ append_resources (sd_bus_message *m,
                   int cgroup_mode,
                   const char *scope,
                   bool *devices_set,
+                  bool *devices_map,
                   libcrun_error_t *err)
 {
   uint64_t value;
@@ -1532,6 +1640,7 @@ append_resources (sd_bus_message *m,
   cleanup_free char **missing_properties = NULL;
 
   *devices_set = false;
+  *devices_map = false;
 
   ret = append_paths (&dir, err, state_dir, SYSTEMD_MISSING_PROPERTIES_DIR, NULL);
   if (UNLIKELY (ret < 0))
@@ -1578,22 +1687,9 @@ append_resources (sd_bus_message *m,
   APPEND_UINT64 ("MemorySwapMax", get_memory_swap_max);
   APPEND_UINT64 ("TasksMax", get_pids_max);
 
-  if (resources->cpu)
-    {
-      /* do not bother with systemd internal representation unless both values are specified */
-      if (resources->cpu->quota > 0 && resources->cpu->period)
-        {
-          uint64_t quota = resources->cpu->quota;
-
-          /* this conversion was copied from runc.  */
-          quota = (quota * 1000000) / resources->cpu->period;
-          if (quota % 10000)
-            quota = ((quota / 10000) + 1) * 10000;
-
-          APPEND_UINT64_VALUE ("CPUQuotaPerSecUSec", quota);
-          APPEND_UINT64_VALUE ("CPUQuotaPeriodUSec", resources->cpu->period);
-        }
-    }
+  ret = append_cpu_quota (m, missing_properties, resources, err);
+  if (UNLIKELY (ret < 0))
+    return ret;
 
   switch (cgroup_mode)
     {
@@ -1615,13 +1711,17 @@ append_resources (sd_bus_message *m,
         if (UNLIKELY (ret < 0))
           return ret;
 
-        if (resources->cpu && resources->cpu->cpus)
+        if (get_string_from_unified_map (resources, "cpuset.cpus") || (resources->cpu && resources->cpu->cpus))
           {
             const char *property_name = "AllowedCPUs";
+            const char *value = get_string_from_unified_map (resources, "cpuset.cpus");
             cleanup_free char *allowed_cpus = NULL;
             size_t allowed_cpus_len = 0;
 
-            ret = cpuset_string_to_bitmask (resources->cpu->cpus, &allowed_cpus, &allowed_cpus_len, err);
+            if (value == NULL)
+              value = resources->cpu->cpus;
+
+            ret = cpuset_string_to_bitmask (value, &allowed_cpus, &allowed_cpus_len, err);
             if (UNLIKELY (ret < 0))
               return ret;
 
@@ -1633,13 +1733,17 @@ append_resources (sd_bus_message *m,
               }
           }
 
-        if (resources->cpu && resources->cpu->mems)
+        if (get_string_from_unified_map (resources, "cpuset.mems") || (resources->cpu && resources->cpu->mems))
           {
             const char *property_name = "AllowedMemoryNodes";
+            const char *value = get_string_from_unified_map (resources, "cpuset.mems");
             cleanup_free char *allowed_mems = NULL;
             size_t allowed_mems_len = 0;
 
-            ret = cpuset_string_to_bitmask (resources->cpu->mems, &allowed_mems, &allowed_mems_len, err);
+            if (value == NULL)
+              value = resources->cpu->mems;
+
+            ret = cpuset_string_to_bitmask (value, &allowed_mems, &allowed_mems_len, err);
             if (UNLIKELY (ret < 0))
               return ret;
 
@@ -1651,7 +1755,7 @@ append_resources (sd_bus_message *m,
               }
           }
 
-        ret = add_bpf_program (m, is_update, resources, missing_properties, scope, devices_set, err);
+        ret = add_bpf_program (m, is_update, resources, missing_properties, scope, devices_set, devices_map, err);
         if (UNLIKELY (ret < 0))
           return ret;
       }
@@ -1733,6 +1837,80 @@ verify_ebpf_device_filter_installed (const char *cgroup_path, libcrun_error_t *e
   return 0;
 }
 
+/* Return 1 if the device filter of the scope does not read its rules from a map.  */
+static int
+set_device_rules (runtime_spec_schema_config_linux_resources *resources, const char *cgroup_path,
+                  libcrun_error_t *err)
+{
+  cleanup_close int dirfd = -1;
+
+  if (cgroup_path == NULL)
+    return crun_make_error (err, 0, "cannot find the cgroup of the scope");
+
+  dirfd = open_cgroup_subsystem ("", cgroup_path, err);
+  if (UNLIKELY (dirfd < 0))
+    return dirfd;
+
+  return libcrun_ebpf_devices_update (resources->devices, resources->devices_len, dirfd, err);
+}
+
+/* The device filter of the scope was generated from its rules, and systemd does not allow to change BPFProgram= on a
+   running unit.  Accept only an update that generates the same program.  */
+static int
+check_device_program_unchanged (runtime_spec_schema_config_linux_resources *resources, const char *scope,
+                                libcrun_error_t *err)
+{
+  cleanup_free struct bpf_program *program_loaded = NULL;
+  cleanup_free struct bpf_program *program = NULL;
+  cleanup_free char *path = NULL;
+  int ret;
+
+  program = create_dev_bpf (resources->devices, resources->devices_len, err);
+  if (UNLIKELY (program == NULL))
+    return -1;
+
+  ret = bpfprog_path_from_scope (&path, scope, err);
+  if (UNLIKELY (ret < 0))
+    return ret;
+
+  ret = libcrun_ebpf_read_program (&program_loaded, path, err);
+  if (UNLIKELY (ret < 0))
+    return ret;
+
+  /* it is the same as the loaded program.  */
+  if (libcrun_ebpf_cmp_programs (program, program_loaded))
+    return 0;
+
+  /* Some platforms (e.g. ppc64) modify an EBPF program as it is
+   * loaded into the kernel, so in order to compare we actually
+   * have to load the new program and read it back.
+   */
+  {
+    cleanup_free struct bpf_program *program_new = NULL;
+    char tmp[64];
+    int len;
+
+    /* A unique name, as container name can't start with a digit. */
+    len = snprintf (tmp, sizeof (tmp), "%s/%d", CRUN_BPF_DIR, getpid ());
+    if (UNLIKELY (len >= (int) sizeof (tmp)))
+      return crun_make_error (err, 0, "internal error: static buffer too small");
+
+    ret = libcrun_ebpf_load (program, -1, tmp, err);
+    if (UNLIKELY (ret < 0))
+      return ret;
+
+    ret = libcrun_ebpf_read_program (&program_new, tmp, err);
+    unlink (tmp);
+    if (UNLIKELY (ret < 0))
+      return ret;
+
+    if (libcrun_ebpf_cmp_programs (program_new, program_loaded))
+      return 0;
+  }
+
+  return crun_make_error (err, 0, "updating device access list not supported when using BPFProgram");
+}
+
 /* Release the sd-bus objects used by a D-Bus call and return RET.  */
 static int
 cleanup_sd_bus_and_return (sd_bus *bus, sd_bus_message *m, sd_bus_message *reply,
@@ -1757,6 +1935,7 @@ enter_systemd_cgroup_scope (runtime_spec_schema_config_linux_resources *resource
                             pid_t pid,
                             bool *can_retry,
                             bool *devices_set,
+                            bool *devices_map,
                             libcrun_error_t *err)
 {
   sd_bus *bus = NULL;
@@ -1772,6 +1951,7 @@ enter_systemd_cgroup_scope (runtime_spec_schema_config_linux_resources *resource
 
   *can_retry = false;
   *devices_set = false;
+  *devices_map = false;
 
   ret = libcrun_get_state_directory (&state_dir, state_root, NULL, err);
   if (UNLIKELY (ret < 0))
@@ -1895,7 +2075,7 @@ enter_systemd_cgroup_scope (runtime_spec_schema_config_linux_resources *resource
         }
     }
 
-  ret = append_resources (m, false, state_dir, resources, cgroup_mode, scope, devices_set, err);
+  ret = append_resources (m, false, state_dir, resources, cgroup_mode, scope, devices_set, devices_map, err);
   if (UNLIKELY (ret < 0))
     goto exit;
 
@@ -2045,6 +2225,7 @@ libcrun_cgroup_enter_systemd (struct libcrun_cgroup_args *args,
   const char *suffix;
   const char *id = args->id;
   pid_t pid = args->pid;
+  bool devices_map = false;
   int cgroup_mode;
   int rootless = 0;
   int ret;
@@ -2067,7 +2248,7 @@ libcrun_cgroup_enter_systemd (struct libcrun_cgroup_args *args,
       bool can_retry = false;
 
       ret = enter_systemd_cgroup_scope (resources, cgroup_mode, args->annotations, args->state_root,
-                                        scope, slice, pid, &can_retry, &out->bpf_dev_set, err);
+                                        scope, slice, pid, &can_retry, &out->bpf_dev_set, &devices_map, err);
       if (LIKELY (ret >= 0))
         break;
 
@@ -2077,14 +2258,14 @@ libcrun_cgroup_enter_systemd (struct libcrun_cgroup_args *args,
           continue;
         }
 
-      return ret;
+      goto fail;
     }
 
   suffix = find_systemd_subgroup (args->annotations);
 
   ret = systemd_finalize (args, &path, cgroup_mode, suffix, err);
   if (UNLIKELY (ret < 0))
-    return ret;
+    goto fail;
 
   /* Remove the suffix that was added by systemd_finalize.  */
   if (is_empty_string (suffix))
@@ -2094,9 +2275,7 @@ libcrun_cgroup_enter_systemd (struct libcrun_cgroup_args *args,
       size_t path_len = strlen (path);
       size_t suffix_len = strlen (suffix);
 
-      scope_path = strndup (path, path_len - suffix_len - 1);
-      if (UNLIKELY (scope_path == NULL))
-        OOM ();
+      scope_path = xstrndup (path, path_len - suffix_len - 1);
     }
 
   /* The cgroup path is chosen by systemd, so it cannot be checked before
@@ -2105,15 +2284,27 @@ libcrun_cgroup_enter_systemd (struct libcrun_cgroup_args *args,
      the scope is.  */
   ret = libcrun_cgroup_ensure_not_frozen (scope_path, err);
   if (UNLIKELY (ret < 0))
-    return ret;
+    goto fail;
 
-  /* Verify that systemd has actually installed the eBPF device filter if one was requested.
-     eBPF programs are attached to the systemd scope, not the subgroup.  */
-  if (out->bpf_dev_set)
+  /* The eBPF device filter is attached to the systemd scope, not to the subgroup.  Set its rules, or if it does not
+     read them from a map verify that systemd has actually installed it.  */
+  if (out->bpf_dev_set && devices_map)
+    {
+      ret = set_device_rules (resources, scope_path, err);
+      if (UNLIKELY (ret < 0))
+        goto fail;
+
+      if (ret > 0)
+        {
+          ret = crun_make_error (err, 0, "systemd failed to install eBPF device filter on cgroup `%s`", scope_path);
+          goto fail;
+        }
+    }
+  else if (out->bpf_dev_set)
     {
       ret = verify_ebpf_device_filter_installed (scope_path, err);
       if (UNLIKELY (ret < 0))
-        return ret;
+        goto fail;
     }
 
   out->path = path;
@@ -2122,6 +2313,11 @@ libcrun_cgroup_enter_systemd (struct libcrun_cgroup_args *args,
   out->scope = scope;
   scope = NULL;
   return 0;
+
+fail:
+  if (out->bpf_dev_set)
+    remove_bpf_program (scope);
+  return ret;
 }
 
 char *
@@ -2135,10 +2331,12 @@ get_cgroup_scope_path (const char *cgroup_path, const char *scope)
 
   path_to_scope = xstrdup (cgroup_path);
 
-  cur = strchr (path_to_scope, '/');
-  while (cur)
+  cur = path_to_scope;
+  while (*cur == '/')
+    cur++;
+  while (*cur)
     {
-      char *next = strchr (cur + 1, '/');
+      char *next = strchr (cur, '/');
       if (next == NULL)
         break;
 
@@ -2160,7 +2358,6 @@ libcrun_destroy_cgroup_systemd (struct libcrun_cgroup_status *cgroup_status,
                                 libcrun_error_t *err)
 {
   cleanup_free char *path_to_scope = NULL;
-  cleanup_free char *bpfprog = NULL;
   int mode;
   int ret;
 
@@ -2176,11 +2373,7 @@ libcrun_destroy_cgroup_systemd (struct libcrun_cgroup_status *cgroup_status,
   if (UNLIKELY (ret < 0))
     crun_error_release (err);
 
-  ret = bpfprog_path_from_scope (&bpfprog, cgroup_status->scope, err);
-  if (UNLIKELY (ret < 0))
-    crun_error_release (err);
-  else
-    unlink (bpfprog); // Best effort.
+  remove_bpf_program (cgroup_status->scope);
 
   path_to_scope = get_cgroup_scope_path (cgroup_status->path, cgroup_status->scope);
 
@@ -2199,6 +2392,7 @@ libcrun_update_resources_systemd (struct libcrun_cgroup_status *cgroup_status,
   sd_bus_message *reply = NULL;
   sd_bus_message *m = NULL;
   sd_bus *bus = NULL;
+  bool devices_map = false;
   int sd_err, ret;
   int cgroup_mode;
 
@@ -2242,9 +2436,28 @@ libcrun_update_resources_systemd (struct libcrun_cgroup_status *cgroup_status,
       goto exit;
     }
 
-  ret = append_resources (m, true, state_dir, resources, cgroup_mode, cgroup_status->scope, &cgroup_status->bpf_dev_set, err);
+  ret = append_resources (m, true, state_dir, resources, cgroup_mode, cgroup_status->scope, &cgroup_status->bpf_dev_set,
+                          &devices_map, err);
   if (UNLIKELY (ret < 0))
     goto exit;
+
+  /* The device filter is attached to the scope, and not to the cgroup where the container runs.  It is updated before the
+     other resources, so that an update that is not possible changes nothing.  */
+  if (cgroup_status->bpf_dev_set && resources->devices_len)
+    {
+      cleanup_free char *scope_path = get_cgroup_scope_path (cgroup_status->path, cgroup_status->scope);
+
+      ret = set_device_rules (resources, scope_path, err);
+      if (UNLIKELY (ret < 0))
+        goto exit;
+
+      if (ret > 0)
+        {
+          ret = check_device_program_unchanged (resources, cgroup_status->scope, err);
+          if (UNLIKELY (ret < 0))
+            goto exit;
+        }
+    }
 
   sd_err = sd_bus_message_close_container (m);
   if (UNLIKELY (sd_err < 0))

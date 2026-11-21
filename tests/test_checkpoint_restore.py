@@ -21,6 +21,7 @@ import os
 import signal
 import subprocess
 import errno
+import select
 import tempfile
 from tests_utils import *
 
@@ -85,7 +86,8 @@ def _get_cmdline(cid):
     return ""
 
 
-def run_cr_test(conf, before_checkpoint_cb=None, before_restore_cb=None):
+def run_cr_test(conf, before_checkpoint_cb=None, before_restore_cb=None, after_restore_cb=None,
+                callback_prepare_rootfs=None):
     cid = None
     cr_dir = os.path.join(get_tests_root(), 'checkpoint')
     work_dir = os.path.join(get_tests_root(), 'work-dir')
@@ -95,7 +97,8 @@ def run_cr_test(conf, before_checkpoint_cb=None, before_restore_cb=None):
             conf,
             all_dev_null=True,
             use_popen=True,
-            detach=True
+            detach=True,
+            callback_prepare_rootfs=callback_prepare_rootfs
         )
         logger.info("run_cr_test: container started with id=%s", cid)
 
@@ -143,6 +146,9 @@ def run_cr_test(conf, before_checkpoint_cb=None, before_restore_cb=None):
             logger.info("run_cr_test: FAILED - cmdline mismatch: first='%s' second='%s'", first_cmdline, second_cmdline)
             return -1
         logger.info("run_cr_test: SUCCESS - cmdlines match")
+
+        if after_restore_cb is not None:
+            return after_restore_cb(cid)
     except Exception as e:
         logger.info("run_cr_test: EXCEPTION - %s", e)
         raise
@@ -343,6 +349,220 @@ def test_cr_pre_dump():
     return 0
 
 
+def _popen_with_status_fd(make_args, timeout=30, **kwargs):
+    """Run make_args(fd) in the background, and wait for it to write a zero
+    byte to fd once ready. Return the process and whether it is ready."""
+    r, w = os.pipe()
+    try:
+        try:
+            p = subprocess.Popen(make_args(w), pass_fds=(w,), **kwargs)
+        finally:
+            os.close(w)
+        ready, _, _ = select.select([r], [], [], timeout)
+        return p, bool(ready) and os.read(r, 1) == b'\0'
+    finally:
+        os.close(r)
+
+
+def _has_pages_img(path):
+    return any(f.startswith("pages-") for f in os.listdir(path))
+
+
+def test_cr_pre_dump_page_server():
+    # libcriu < 4.3 can't set the page server address without lazy pages.
+    if r := _check_cr_requirements(min_criu_version=40300):
+        return r
+
+    if "pre-dump" not in run_crun_command(["checkpoint", "--help"]):
+        return 77, "crun built without pre-dump support"
+
+    conf = base_config()
+    conf['process']['args'] = ['/init', 'pause']
+    add_all_namespaces(conf)
+
+    port = 27278
+    cid = None
+    page_server = None
+    cr_dir = os.path.join(get_tests_root(), 'pre-dump')
+    ps_dir = os.path.join(get_tests_root(), 'page-server')
+    work_dir = os.path.join(get_tests_root(), 'work-dir')
+    try:
+        _, cid = run_and_get_output(
+            conf,
+            all_dev_null=True,
+            use_popen=True,
+            detach=True
+        )
+
+        if _get_cmdline(cid) == "":
+            logger.info("test_cr_pre_dump_page_server: failed to get cmdline")
+            return -1
+
+        os.makedirs(ps_dir, exist_ok=True)
+        page_server, ready = _popen_with_status_fd(lambda fd: [
+            "criu", "page-server",
+            "--address", "127.0.0.1",
+            "--port", str(port),
+            "--status-fd", str(fd),
+            "--images-dir", ps_dir,
+            "--log-file", "page-server.log",
+            "-v4"
+        ])
+
+        if not ready:
+            logger.info("test_cr_pre_dump_page_server: page server is not ready")
+            return -1
+
+        run_crun_command([
+            "checkpoint",
+            "--pre-dump",
+            "--page-server=127.0.0.1:%d" % port,
+            "--image-path=%s" % cr_dir,
+            "--work-path=%s" % work_dir,
+            cid
+        ])
+
+        if _has_pages_img(cr_dir):
+            logger.info("test_cr_pre_dump_page_server: pages saved locally")
+            return -1
+
+        if page_server.wait(timeout=60) != 0:
+            logger.info("test_cr_pre_dump_page_server: page server failed")
+            return -1
+
+        if not _has_pages_img(ps_dir):
+            logger.info("test_cr_pre_dump_page_server: no pages received by the page server")
+            return -1
+
+    except Exception as e:
+        logger.info("test_cr_pre_dump_page_server: exception: %s", e)
+        return -1
+    finally:
+        if page_server is not None and page_server.poll() is None:
+            page_server.kill()
+            page_server.wait()
+        if cid is not None:
+            run_crun_command(["delete", "-f", cid])
+    return 0
+
+
+def test_cr_lazy_pages():
+    if r := _check_cr_requirements():
+        return r
+
+    if subprocess.run(["criu", "check", "--feature", "uffd-noncoop"],
+                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode != 0:
+        return 77, "CRIU does not support lazy pages"
+
+    conf = base_config()
+    conf['process']['args'] = ['/init', 'pause']
+    add_all_namespaces(conf)
+
+    port = 27277
+    cid = None
+    restored_cid = None
+    checkpoint = None
+    lazy_pages = None
+    cr_dir = os.path.join(get_tests_root(), 'checkpoint')
+    work_dir = os.path.join(get_tests_root(), 'work-dir')
+    crun = [get_crun_path(), "--root", get_tests_root_status()]
+    try:
+        _, cid = run_and_get_output(
+            conf,
+            all_dev_null=True,
+            use_popen=True,
+            detach=True
+        )
+
+        first_cmdline = _get_cmdline(cid)
+        if first_cmdline == "":
+            logger.info("test_cr_lazy_pages: failed to get first cmdline")
+            return -1
+
+        # The checkpoint only completes once all the memory pages are
+        # transferred, so run it in the background, and wait for the
+        # page server to be ready.
+        checkpoint, ready = _popen_with_status_fd(lambda fd: crun + [
+            "checkpoint",
+            "--lazy-pages",
+            "--page-server=127.0.0.1:%d" % port,
+            "--status-fd=%d" % fd,
+            "--manage-cgroups-mode=ignore",
+            "--image-path=%s" % cr_dir,
+            "--work-path=%s" % work_dir,
+            cid
+        ], stderr=subprocess.PIPE)
+
+        if not ready:
+            checkpoint.kill()
+            _, stderr = checkpoint.communicate()
+            if b"not supported by this libcriu" in stderr:
+                return 77, "libcriu does not support lazy pages"
+            logger.info("test_cr_lazy_pages: page server is not ready: %s", stderr.decode(errors='ignore'))
+            return -1
+
+        lazy_pages, ready = _popen_with_status_fd(lambda fd: [
+            "criu", "lazy-pages",
+            "--page-server",
+            "--address", "127.0.0.1",
+            "--port", str(port),
+            "--status-fd", str(fd),
+            "--images-dir", cr_dir,
+            "--work-dir", work_dir,
+            "--log-file", "lazy-pages.log",
+            "-v4"
+        ])
+
+        if not ready:
+            logger.info("test_cr_lazy_pages: lazy-pages daemon is not ready")
+            return -1
+
+        # The original container is still around until all the memory
+        # pages are transferred, so restore under a different name.
+        bundle = os.path.join(
+            get_tests_root(),
+            cid.split('-')[1]
+        )
+        restored_cid = cid + "-restored"
+        run_crun_command([
+            "restore",
+            "-d",
+            "--lazy-pages",
+            "--manage-cgroups-mode=ignore",
+            "--image-path=%s" % cr_dir,
+            "--work-path=%s" % work_dir,
+            "--bundle=%s" % bundle,
+            restored_cid
+        ])
+
+        second_cmdline = _get_cmdline(restored_cid)
+        if first_cmdline != second_cmdline:
+            logger.info("test_cr_lazy_pages: cmdline mismatch after restore")
+            return -1
+
+        if lazy_pages.wait(timeout=60) != 0:
+            logger.info("test_cr_lazy_pages: lazy-pages daemon failed")
+            return -1
+
+        _, stderr = checkpoint.communicate(timeout=60)
+        if checkpoint.returncode != 0:
+            logger.info("test_cr_lazy_pages: checkpoint failed: %s", stderr.decode(errors='ignore'))
+            return -1
+
+    except Exception as e:
+        logger.info("test_cr_lazy_pages: exception: %s", e)
+        return -1
+    finally:
+        for p in (lazy_pages, checkpoint):
+            if p is not None and p.poll() is None:
+                p.kill()
+                p.wait()
+        for c in (restored_cid, cid):
+            if c is not None and os.path.exists(os.path.join(get_tests_root_status(), c)):
+                run_crun_command(["delete", "-f", c])
+    return 0
+
+
 def test_cr():
     if r := _check_cr_requirements():
         return r
@@ -352,6 +572,49 @@ def test_cr():
     add_all_namespaces(conf)
     return run_cr_test(conf)
 
+
+def test_cr_userns():
+    if r := _check_cr_requirements():
+        return r
+
+    conf = base_config()
+    conf['process']['args'] = ['/init', 'pause']
+    add_all_namespaces(conf, userns=True, cgroupns=True)
+    conf['linux']['uidMappings'] = [{"containerID": 0, "hostID": 0, "size": 65536}]
+    conf['linux']['gidMappings'] = [{"containerID": 0, "hostID": 0, "size": 65536}]
+    return run_cr_test(conf)
+
+
+
+def test_cr_userns_devices():
+    if r := _check_cr_requirements():
+        return r
+
+    conf = base_config()
+    conf['process']['args'] = ['/init', 'pause']
+    add_all_namespaces(conf, userns=True, cgroupns=True)
+    conf['linux']['uidMappings'] = [{"containerID": 0, "hostID": 0, "size": 65536}]
+    conf['linux']['gidMappings'] = [{"containerID": 0, "hostID": 0, "size": 65536}]
+    devices = ['/dev/foo', '/dev/null']
+    conf['linux']['devices'] = [
+        {"path": path, "type": "c", "major": 1, "minor": 3, "uid": 10, "gid": 11, "fileMode": 0o600}
+        for path in devices
+    ]
+
+    def check_devices(cid):
+        s = wait_for_state(cid)
+        if s is None:
+            logger.info("test_cr_userns_devices: container %s is not running", cid)
+            return -1
+        for path in devices:
+            st = os.stat("/proc/%s/root%s" % (s['pid'], path))
+            if (st.st_uid, st.st_gid, st.st_mode & 0o7777) != (10, 11, 0o600):
+                logger.info("test_cr_userns_devices: %s is %d:%d %o after restore",
+                            path, st.st_uid, st.st_gid, st.st_mode & 0o7777)
+                return -1
+        return 0
+
+    return run_cr_test(conf, after_restore_cb=check_devices)
 
 def test_cr_masked_paths():
     if r := _check_cr_requirements():
@@ -365,6 +628,380 @@ def test_cr_masked_paths():
     # mount for CRIU, and must be found under the same key on restore.
     conf['linux']['maskedPaths'] = ['/sys/firmware', '/proc/kcore']
     return run_cr_test(conf)
+
+
+# Once it is restored, the container is running and decides what its stdin,
+# stdout and stderr point to.  That must not make the restore fail.
+def test_cr_long_stdin_path():
+    if r := _check_cr_requirements():
+        return r
+
+    data_dir = os.path.join(get_tests_root(), 'long-stdin-path')
+    os.makedirs(data_dir)
+
+    conf = base_config()
+    conf['process']['args'] = ['/init', 'long-stdin-path', '/data']
+    add_all_namespaces(conf)
+    conf['mounts'].append({"destination": "/data", "type": "bind", "source": data_dir, "options": ["bind", "rw"]})
+
+    def wait_for_ready():
+        for _ in range(100):
+            if os.path.exists(os.path.join(data_dir, 'ready')):
+                return
+            time.sleep(0.1)
+        raise Exception("the container is not ready to be checkpointed")
+
+    def mark_restored():
+        with open(os.path.join(data_dir, 'restored'), 'w'):
+            pass
+
+    return run_cr_test(conf, before_checkpoint_cb=wait_for_ready, before_restore_cb=mark_restored)
+# exec loads the seccomp filter from the state directory, which is deleted
+# by the checkpoint, so the restore must generate it again.
+def test_cr_exec_seccomp():
+    if r := _check_cr_requirements():
+        return r
+    if 'SECCOMP' not in get_crun_feature_string():
+        return 77, "crun built without seccomp support"
+
+    conf = base_config()
+    conf['process']['args'] = ['/init', 'pause']
+    add_all_namespaces(conf, netns=False)
+    conf['linux']['seccomp'] = {
+        'defaultAction': 'SCMP_ACT_ALLOW',
+        'syscalls': [
+            {
+                'names': ['unshare'],
+                'action': 'SCMP_ACT_ERRNO',
+                'errnoRet': 1
+            }
+        ]
+    }
+
+    def check_exec_seccomp(cid):
+        out = run_crun_command(["exec", cid, "/init", "cat", "/proc/self/status"])
+        mode = parse_proc_status(out).get('Seccomp')
+        if mode != '2':
+            logger.info("test_cr_exec_seccomp: expected seccomp mode 2 after restore, got %s", mode)
+            return -1
+        return 0
+
+    return run_cr_test(conf, after_restore_cb=check_exec_seccomp)
+# CRIU gets the source of an external mount from crun and its flags from the
+# image, i.e. from whatever was mounted at that path when the container was
+# checkpointed.  Each source must be restored with the flags the configuration
+# asks for it anyway.
+def test_cr_mount_flags():
+    if r := _check_cr_requirements():
+        return r
+
+    cid = None
+    cr_dir = os.path.join(get_tests_root(), 'checkpoint-mount-flags')
+    work_dir = os.path.join(get_tests_root(), 'work-dir')
+    ro_dir = os.path.join(get_tests_root(), 'mount-flags-ro')
+    rw_dir = os.path.join(get_tests_root(), 'mount-flags-rw')
+    os.makedirs(ro_dir)
+    os.makedirs(rw_dir)
+
+    masked = ['/sys/firmware', '/sys/kernel']
+    conf = base_config()
+    conf['process']['args'] = ['/init', 'pause']
+    add_all_namespaces(conf)
+    conf['linux']['maskedPaths'] = masked
+    conf['mounts'] += [
+        {"destination": "/a/data", "type": "bind", "source": ro_dir,
+         "options": ["bind", "ro", "nosuid", "nodev", "noexec"]},
+        {"destination": "/b/data", "type": "bind", "source": rw_dir, "options": ["bind", "rw"]},
+        {"destination": "/c", "type": "bind", "source": ro_dir, "options": ["bind", "ro"]},
+    ]
+
+    try:
+        _, cid = run_and_get_output(
+            conf,
+            all_dev_null=True,
+            use_popen=True,
+            detach=True
+        )
+
+        if wait_for_state(cid) is None:
+            logger.info("test_cr_mount_flags: the container did not start")
+            return -1
+
+        # A mount point cannot be renamed, but its parent directory can, also
+        # from inside the container: exchange the read-only and the read-write
+        # mount before the checkpoint.
+        bundle = os.path.join(get_tests_root(), cid.split('-')[1])
+        rootfs = os.path.join(bundle, 'rootfs')
+        os.rename(os.path.join(rootfs, 'a'), os.path.join(rootfs, 'tmp'))
+        os.rename(os.path.join(rootfs, 'b'), os.path.join(rootfs, 'a'))
+        os.rename(os.path.join(rootfs, 'tmp'), os.path.join(rootfs, 'b'))
+
+        run_crun_command([
+            "checkpoint",
+            "--image-path=%s" % cr_dir,
+            "--work-path=%s" % work_dir,
+            cid
+        ])
+
+        run_crun_command([
+            "restore",
+            "-d",
+            "--image-path=%s" % cr_dir,
+            "--work-path=%s" % work_dir,
+            "--bundle=%s" % bundle,
+            cid
+        ])
+
+        s = wait_for_state(cid)
+        if s is None:
+            logger.info("test_cr_mount_flags: the container was not restored")
+            return -1
+
+        found = 0
+        with open("/proc/%s/mountinfo" % s['pid']) as f:
+            for line in f:
+                _, _, _, root, mountpoint, options = line.split()[:6]
+                expected = set()
+                if root.endswith('/mount-flags-ro'):
+                    found += 1
+                    expected = {'ro'} if mountpoint == '/c' else {'ro', 'nosuid', 'nodev', 'noexec'}
+                elif mountpoint in masked:
+                    expected = {'ro'}
+                if not expected.issubset(options.split(',')):
+                    logger.info("test_cr_mount_flags: `%s` restored at `%s` with `%s`, expected `%s`",
+                                root, mountpoint, options, ','.join(sorted(expected)))
+                    return -1
+
+        if found != 2:
+            logger.info("test_cr_mount_flags: found %d mounts of `%s`, expected 2", found, ro_dir)
+            return -1
+    finally:
+        if cid is not None:
+            run_crun_command(["delete", "-f", cid])
+    return 0
+
+
+# The mountpoints are recreated on restore in a rootfs that is under the
+# control of the container.  Nothing must be created in the source of a
+# read-only bind mount, as the container could not do it either.
+def test_cr_ro_bind_source_not_modified():
+    if r := _check_cr_requirements():
+        return r
+
+    cid = None
+    cr_dir = os.path.join(get_tests_root(), 'checkpoint-ro-bind-source')
+    work_dir = os.path.join(get_tests_root(), 'work-dir')
+    ro_dir = os.path.join(get_tests_root(), 'ro-bind-source-ro')
+    rw_file = os.path.join(get_tests_root(), 'ro-bind-source-rw')
+    os.makedirs(ro_dir)
+    open(rw_file, 'w').close()
+
+    conf = base_config()
+    conf['process']['args'] = ['/init', 'pause']
+    add_all_namespaces(conf, netns=False)
+    conf['mounts'] += [
+        {"destination": "/ro", "type": "bind", "source": ro_dir, "options": ["bind", "ro"]},
+        {"destination": "/a/data", "type": "bind", "source": rw_file, "options": ["bind", "rw"]},
+    ]
+
+    def prepare_rootfs(rootfs):
+        # Hidden by the read-only mount.
+        os.makedirs(os.path.join(rootfs, 'ro', 'dir'))
+        os.symlink('/b/data', os.path.join(rootfs, 'ro', 'dir', 'data'))
+
+    try:
+        _, cid = run_and_get_output(
+            conf,
+            all_dev_null=True,
+            use_popen=True,
+            detach=True,
+            callback_prepare_rootfs=prepare_rootfs
+        )
+
+        if wait_for_state(cid) is None:
+            logger.info("test_cr_ro_bind_source_not_modified: the container did not start")
+            return -1
+
+        run_crun_command([
+            "checkpoint",
+            "--image-path=%s" % cr_dir,
+            "--work-path=%s" % work_dir,
+            cid
+        ])
+
+        # A mountpoint cannot be renamed, its parent directory can, also from
+        # the container: move the second mount away, and make its destination
+        # a symlink to a path that does not exist in the read-only mount.
+        bundle = os.path.join(get_tests_root(), cid.split('-')[1])
+        rootfs = os.path.join(bundle, 'rootfs')
+        os.rename(os.path.join(rootfs, 'a'), os.path.join(rootfs, 'b'))
+        os.mkdir(os.path.join(rootfs, 'a'))
+        os.symlink('/ro/dir/data', os.path.join(rootfs, 'a', 'data'))
+
+        # The restore can fail, the mountpoint cannot be created.
+        try:
+            run_crun_command_raw([
+                "restore",
+                "-d",
+                "--image-path=%s" % cr_dir,
+                "--work-path=%s" % work_dir,
+                "--bundle=%s" % bundle,
+                cid
+            ])
+        except subprocess.CalledProcessError:
+            cid = None
+
+        content = os.listdir(ro_dir)
+        if content:
+            logger.info("test_cr_ro_bind_source_not_modified: created %s in the bind mount source", content)
+            return -1
+    finally:
+        if cid is not None:
+            run_crun_command(["delete", "-f", cid])
+    return 0
+
+
+# The key of an external mount is its destination as resolved in the
+# container, so the container chooses it.  CRIU stores it as "mnt[KEY]:VAL":
+# a key that has a meaning for CRIU must be refused, and so must the root.
+def test_cr_mount_invalid_key():
+    if r := _check_cr_requirements():
+        return r
+
+    cid = None
+    cr_dir = os.path.join(get_tests_root(), 'checkpoint-mount-invalid-key')
+    work_dir = os.path.join(get_tests_root(), 'work-dir')
+    source = os.path.join(get_tests_root(), 'mount-invalid-key')
+    os.makedirs(source, exist_ok=True)
+
+    conf = base_config()
+    conf['process']['args'] = ['/init', 'pause']
+    add_all_namespaces(conf)
+    conf['mounts'].append({"destination": "/a/data", "type": "bind", "source": source, "options": ["bind"]})
+
+    try:
+        _, cid = run_and_get_output(
+            conf,
+            all_dev_null=True,
+            use_popen=True,
+            detach=True
+        )
+
+        if wait_for_state(cid) is None:
+            logger.info("test_cr_mount_invalid_key: the container did not start")
+            return -1
+
+        # A mount point cannot be replaced, but its parent directory can,
+        # also from inside the container.  The destination is resolved in
+        # the running container, so the targets must exist there.
+        rootfs = os.path.join(get_tests_root(), cid.split('-')[1], 'rootfs')
+        os.rename(os.path.join(rootfs, 'a'), os.path.join(rootfs, 'b'))
+        os.mkdir(os.path.join(rootfs, 'a'))
+        os.makedirs(os.path.join(rootfs, 'b', 'data]:', 'name'))
+
+        for target in ("/b/data]:/name", "/"):
+            os.symlink(target, os.path.join(rootfs, 'a', 'data'))
+            try:
+                run_crun_command_raw([
+                    "checkpoint",
+                    "--image-path=%s" % cr_dir,
+                    "--work-path=%s" % work_dir,
+                    cid
+                ])
+                logger.info("test_cr_mount_invalid_key: checkpoint succeeded with `%s`", target)
+                return -1
+            except subprocess.CalledProcessError as e:
+                if b"invalid external mount destination" not in e.output:
+                    logger.info("test_cr_mount_invalid_key: unexpected error with `%s`: %s", target, e.output)
+                    return -1
+            os.unlink(os.path.join(rootfs, 'a', 'data'))
+    finally:
+        if cid is not None:
+            run_crun_command(["delete", "-f", cid])
+    return 0
+
+
+# Checkpoint and restore CONF with a bind mount to each destination in BINDS,
+# read-only if it is in READ_ONLY, and check that it is restored at the mount
+# point BINDS has for it.
+def _run_cr_binds_test(conf, binds, read_only=(), **kwargs):
+    sources = {}
+    for destination, mount_point in binds.items():
+        source = os.path.join(get_tests_root(), 'bind' + destination.replace('/', '-'))
+        os.makedirs(source, exist_ok=True)
+        sources[source] = mount_point
+        conf['mounts'].append({"destination": destination, "type": "bind", "source": source,
+                               "options": ["bind", "ro" if destination in read_only else "rw"]})
+
+    def check_mount_points(cid):
+        s = wait_for_state(cid)
+        if s is None:
+            logger.info("_run_cr_binds_test: container %s is not running", cid)
+            return -1
+        for source, mount_point in sources.items():
+            path = "/proc/%s/root%s" % (s['pid'], mount_point)
+            if not os.path.samestat(os.stat(source), os.stat(path)):
+                logger.info("_run_cr_binds_test: `%s` is not mounted at `%s`", source, mount_point)
+                return -1
+        return 0
+
+    return run_cr_test(conf, after_restore_cb=check_mount_points, **kwargs)
+
+
+# The root path is relative to the bundle and the destination goes through a
+# link in the rootfs, also to a tmpfs.
+def test_cr_bind_symlink():
+    if r := _check_cr_requirements():
+        return r
+
+    conf = base_config()
+    conf['process']['args'] = ['/init', 'pause']
+    add_all_namespaces(conf)
+    conf['mounts'].append({"destination": "/b", "type": "tmpfs", "source": "tmpfs", "options": ["rw"]})
+
+    def prepare_rootfs(rootfs):
+        for name in ['a', 'b']:
+            os.makedirs(os.path.join(rootfs, 'real-' + name))
+            os.symlink('real-' + name, os.path.join(rootfs, name))
+
+    return _run_cr_binds_test(conf, {'/a/data': '/real-a/data', '/b/data': '/real-b/data'},
+                              callback_prepare_rootfs=prepare_rootfs)
+
+
+# The destination goes through a link in another mount of the container.
+def _test_cr_bind_symlink_other_mount(read_only):
+    if r := _check_cr_requirements():
+        return r
+
+    conf = base_config()
+    conf['process']['args'] = ['/init', 'pause']
+    add_all_namespaces(conf)
+
+    # The mountpoint cannot be created in a read-only mount.
+    var = os.path.join(get_tests_root(), 'bind-var')
+    os.makedirs(os.path.join(var, 'real', 'data'))
+    os.symlink('real', os.path.join(var, 'link'))
+
+    # An absolute root path, so that only the other mount hides the link.
+    def prepare_rootfs(rootfs):
+        config_path = os.path.join(os.path.dirname(rootfs), 'config.json')
+        with open(config_path) as f:
+            config = json.load(f)
+        config['root']['path'] = rootfs
+        with open(config_path, 'w') as f:
+            json.dump(config, f)
+
+    return _run_cr_binds_test(conf, {'/var': '/var', '/var/link/data': '/var/real/data'},
+                              read_only=('/var',) if read_only else (),
+                              callback_prepare_rootfs=prepare_rootfs)
+
+
+def test_cr_bind_symlink_other_mount():
+    return _test_cr_bind_symlink_other_mount(False)
+
+
+def test_cr_bind_symlink_other_mount_ro():
+    return _test_cr_bind_symlink_other_mount(True)
 
 
 def test_cr_with_ext_ns():
@@ -392,6 +1029,48 @@ def test_cr_with_ext_ns():
             ns.update({'path': os.path.join(ns_path, 'uts')})
 
     return run_cr_test(conf)
+
+
+# A failed restore has no container status, so nothing can destroy its
+# cgroup later: crun must not leave it behind.
+def test_cr_failed_restore_cgroup_cleanup():
+    if r := _check_cr_requirements():
+        return r
+    if not is_cgroup_v2_unified():
+        return (77, "requires cgroup v2")
+    if get_cgroup_manager() == 'systemd':
+        return (77, "test uses cgroupfs-style paths")
+
+    conf = base_config()
+    conf['process']['args'] = ['/init', 'pause']
+    add_all_namespaces(conf)
+
+    cgroup_path = f'/test-failed-restore-{os.getpid()}'
+    conf['linux']['cgroupsPath'] = cgroup_path
+
+    host_cgroup_dir = f'/sys/fs/cgroup{cgroup_path}'
+
+    image_broken = False
+
+    def break_image():
+        nonlocal image_broken
+        os.unlink(os.path.join(get_tests_root(), 'checkpoint', 'inventory.img'))
+        image_broken = True
+
+    try:
+        run_cr_test(conf, before_restore_cb=break_image)
+        logger.info("the restore was expected to fail")
+        return -1
+    except subprocess.CalledProcessError:
+        if not image_broken:
+            raise
+
+    if os.path.exists(host_cgroup_dir):
+        logger.info("cgroup directory %s still exists after the failed restore", host_cgroup_dir)
+        os.rmdir(host_cgroup_dir)
+        return -1
+
+    return 0
 
 
 def test_cr_named_cgroup_hierarchy():
@@ -541,11 +1220,24 @@ def test_cr_with_annotation_config():
 
 all_tests = {
     "checkpoint-restore": test_cr,
+    "checkpoint-restore-userns": test_cr_userns,
+    "checkpoint-restore-userns-devices": test_cr_userns_devices,
     "checkpoint-restore-masked-paths": test_cr_masked_paths,
+    "checkpoint-restore-long-stdin-path": test_cr_long_stdin_path,
+    "checkpoint-restore-exec-seccomp": test_cr_exec_seccomp,
+    "checkpoint-restore-mount-flags": test_cr_mount_flags,
+    "checkpoint-restore-ro-bind-source-not-modified": test_cr_ro_bind_source_not_modified,
+    "checkpoint-restore-mount-invalid-key": test_cr_mount_invalid_key,
+    "checkpoint-restore-bind-symlink": test_cr_bind_symlink,
+    "checkpoint-restore-bind-symlink-other-mount": test_cr_bind_symlink_other_mount,
+    "checkpoint-restore-bind-symlink-other-mount-ro": test_cr_bind_symlink_other_mount_ro,
     "checkpoint-restore-ext-ns": test_cr_with_ext_ns,
+    "checkpoint-restore-failed-cgroup-cleanup": test_cr_failed_restore_cgroup_cleanup,
     "checkpoint-restore-named-cgroup-hierarchy": test_cr_named_cgroup_hierarchy,
     "checkpoint-restore-forward-signal": test_cr_restore_forward_signal,
     "checkpoint-restore-pre-dump": test_cr_pre_dump,
+    "checkpoint-restore-lazy-pages": test_cr_lazy_pages,
+    "checkpoint-restore-pre-dump-page-server": test_cr_pre_dump_page_server,
     "checkpoint-restore-with-runc-config": test_cr_with_runc_config,
     "checkpoint-restore-with-crun-config": test_cr_with_crun_config,
     "checkpoint-restore-with-annotation-config": test_cr_with_annotation_config,

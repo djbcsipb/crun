@@ -26,6 +26,8 @@
 #include <sys/stat.h>
 #include <sys/socket.h>
 #include <errno.h>
+#include <stdint.h>
+#include <sys/mount.h>
 #include <sys/param.h>
 #include <sys/types.h>
 #include <sys/sysmacros.h>
@@ -74,12 +76,17 @@
  */
 #define KRUN_VM_FILE "/.krun_vm.json"
 
+/* KRUN_VM_FILE holds a handful of settings and it is parsed by crun
+ * itself before the container process exists, refuse anything bigger.
+ */
+#define KRUN_VM_FILE_MAX_SIZE (64 * 1024)
+
 #define KRUN_FLAVOR_AWS_NITRO "aws-nitro"
 #define KRUN_FLAVOR_SEV "sev"
 
 /* "krun" in ASCII. */
 #define KRUN_SSH_VSOCK_PORT 0x6b72756e
-/* This is in a mount namespace, not in the host filesystem. */
+/* This is in a mount namespace, not in the host file system. */
 #define KRUN_SSH_SOCK_FILE "/.krun_ssh.sock"
 
 #define FD_PAIR_PARENT 0
@@ -176,10 +183,16 @@ libkrun_read_vm_config (struct krun_config *kconf, int rootfsfd, const char *roo
 {
   int ret;
   cleanup_free char *config = NULL;
+  cleanup_close int pathfd = -1;
   cleanup_close int fd = -1;
+  proc_fd_path_t fd_path;
+  struct stat st;
 
-  fd = safe_openat (rootfsfd, rootfs, KRUN_VM_FILE, O_RDONLY | O_CLOEXEC | O_NOFOLLOW, 0, err);
-  if (fd < 0)
+  /* The content of the rootfs is controlled by the user: look at the file through an
+     O_PATH descriptor first and refuse anything that is not a small regular file, as
+     opening a FIFO blocks and a device node must not be accessed.  */
+  pathfd = safe_openat (rootfsfd, rootfs, KRUN_VM_FILE, O_PATH | O_CLOEXEC | O_NOFOLLOW, 0, err);
+  if (pathfd < 0)
     {
       // The configuration file is optional, don't generate an error if it's missing.
       if (crun_error_get_errno (err) == ENOENT)
@@ -187,10 +200,23 @@ libkrun_read_vm_config (struct krun_config *kconf, int rootfsfd, const char *roo
           crun_error_release (err);
           return 0;
         }
-      return fd;
+      return pathfd;
     }
 
-  ret = read_all_fd (fd, "krun configuration file", &config, NULL, err);
+  ret = fstat (pathfd, &st);
+  if (UNLIKELY (ret < 0))
+    return crun_make_error (err, errno, "stat `%s`", KRUN_VM_FILE);
+
+  if (! S_ISREG (st.st_mode))
+    return crun_make_error (err, 0, "`%s` is not a regular file", KRUN_VM_FILE);
+
+  get_proc_self_fd_path (fd_path, pathfd);
+
+  fd = open (fd_path, O_RDONLY | O_CLOEXEC);
+  if (UNLIKELY (fd < 0))
+    return crun_make_error (err, errno, "open `%s`", KRUN_VM_FILE);
+
+  ret = read_all_fd_with_max_size (fd, KRUN_VM_FILE, &config, NULL, KRUN_VM_FILE_MAX_SIZE, err);
   if (UNLIKELY (ret < 0))
     return ret;
 
@@ -640,7 +666,7 @@ libkrun_exec (void *cookie, libcrun_container_t *container, const char *pathname
     {
       int errcode = crun_error_get_errno (&err);
       libcrun_error_t *tmp_err = &err;
-      libcrun_error_write_warning_and_release (NULL, &tmp_err);
+      libcrun_error_report_and_release (tmp_err);
       error (EXIT_FAILURE, errcode, "could not configure krun vm");
     }
 
@@ -653,10 +679,42 @@ libkrun_exec (void *cookie, libcrun_container_t *container, const char *pathname
   return ret;
 }
 
+static char *
+libkrun_shell_quote (const char *arg)
+{
+  size_t len = 2;
+  const char *p;
+  char *ret, *dest;
+
+  for (p = arg; *p != '\0'; p++)
+    {
+      if (len > SIZE_MAX - 5)
+        error (EXIT_FAILURE, EOVERFLOW, "krun exec: argument too long");
+      len += (*p == '\'') ? 4 : 1;
+    }
+
+  ret = xmalloc (len + 1);
+  dest = ret;
+  *dest++ = '\'';
+  for (p = arg; *p != '\0'; p++)
+    {
+      if (*p == '\'')
+        {
+          memcpy (dest, "'\\''", 4);
+          dest += 4;
+        }
+      else
+        *dest++ = *p;
+    }
+  *dest++ = '\'';
+  *dest = '\0';
+  return ret;
+}
+
 static int
-libkrun_exec_ssh (void *cookie, libcrun_container_t *container,
-                  const char *pathname arg_unused,
-                  runtime_spec_schema_config_schema_process *process)
+libkrun_exec_ssh_impl (libcrun_container_t *container,
+                       runtime_spec_schema_config_schema_process *process,
+                       bool raw_args)
 {
   cleanup_free char *sock_path = NULL;
   cleanup_free char *sock_addr = NULL;
@@ -732,8 +790,10 @@ libkrun_exec_ssh (void *cookie, libcrun_container_t *container,
       argv[i++] = setenv_val;
     }
   argv[i++] = sock_addr;
+  // The guest shell splits the command line again, so each argument must be quoted.
+  // Only the internal control commands sent by libkrun_kill_ssh are passed verbatim.
   for (j = 0; j < n; j++)
-    argv[i++] = process->args[j];
+    argv[i++] = raw_args ? process->args[j] : libkrun_shell_quote (process->args[j]);
   argv[i] = NULL;
 
   execvp ("ssh", argv);
@@ -742,7 +802,15 @@ libkrun_exec_ssh (void *cookie, libcrun_container_t *container,
 }
 
 static int
-libkrun_kill_ssh (void *cookie, libcrun_container_t *container, pid_t pid, int signal, libcrun_error_t *err)
+libkrun_exec_ssh (void *cookie arg_unused, libcrun_container_t *container,
+                  const char *pathname arg_unused,
+                  runtime_spec_schema_config_schema_process *process)
+{
+  return libkrun_exec_ssh_impl (container, process, false);
+}
+
+static int
+libkrun_kill_ssh (void *cookie arg_unused, libcrun_container_t *container, pid_t pid, int signal, libcrun_error_t *err)
 {
   runtime_spec_schema_config_schema_process process = {
     0,
@@ -780,7 +848,7 @@ libkrun_kill_ssh (void *cookie, libcrun_container_t *container, pid_t pid, int s
           dup2 (devnull, STDOUT_FILENO);
           dup2 (devnull, STDERR_FILENO);
         }
-      libkrun_exec_ssh (cookie, container, NULL, &process);
+      libkrun_exec_ssh_impl (container, &process, true);
       _safe_exit (EXIT_FAILURE);
     }
 
@@ -957,11 +1025,30 @@ libkrun_configure_network (void *cookie, libcrun_container_t *container, libcrun
     return crun_make_error (err, errno, "fork passt");
   else if (pid == 0)
     {
+      runtime_spec_schema_config_schema *def = container->container_def;
+      size_t i;
+
       close (kconf->passt_fds[FD_PAIR_PARENT]);
 
       null = open ("/dev/null", O_WRONLY);
       if (null == -1)
         _exit (EXIT_FAILURE);
+
+      /* Remount /proc if the parent detached its PID namespace, as passt(1)
+       * needs a consistent /proc view to operate properly.
+       */
+      for (i = 0; i < def->linux->namespaces_len; i++)
+        {
+          int value = libcrun_find_namespace (def->linux->namespaces[i]->type);
+
+          if (value == CLONE_NEWPID)
+            {
+              if (mount ("", "/proc", "proc", MS_NOSUID | MS_NODEV | MS_NOEXEC, NULL))
+                _exit (EXIT_FAILURE);
+
+              break;
+            }
+        }
 
       // Redirect passt's stdout and stderr to /dev/null, as closing them here
       // instead will cause passt to exit with an error.
@@ -1043,8 +1130,13 @@ libkrun_configure_container (void *cookie, enum handler_configure_phase phase,
         return ret;
 
       /* CVE-2025-24965: the content below rootfs cannot be trusted because it is controlled by the user.  We
-         must ensure the file is opened below the rootfs directory.  */
-      fd = safe_openat (rootfsfd, rootfs, KRUN_CONFIG_FILE, WRITE_FILE_DEFAULT_FLAGS | O_NOFOLLOW, S_IRUSR | S_IRGRP | S_IROTH, err);
+         must ensure the file is opened below the rootfs directory.  Whatever the image ships at that name
+         could also be a device node or a FIFO, so never open it: unlink it and create a new regular file.  */
+      ret = unlinkat (rootfsfd, KRUN_CONFIG_FILE, 0);
+      if (UNLIKELY (ret < 0 && errno != ENOENT))
+        return crun_make_error (err, errno, "unlink `%s`", KRUN_CONFIG_FILE);
+
+      fd = safe_openat (rootfsfd, rootfs, KRUN_CONFIG_FILE, WRITE_FILE_DEFAULT_FLAGS | O_EXCL | O_NOFOLLOW, S_IRUSR | S_IRGRP | S_IROTH, err);
       if (UNLIKELY (fd < 0))
         return fd;
 
@@ -1099,9 +1191,11 @@ libkrun_configure_container (void *cookie, enum handler_configure_phase phase,
       ret = libcrun_create_dev (container, devfd, -1, &sev_device, is_user_ns, true, err);
       if (UNLIKELY (ret < 0))
         {
+          crun_error_release (err);
+
           ret = dlclose (kconf->handle_sev);
-          if (UNLIKELY (ret < 0))
-            return ret;
+          if (UNLIKELY (ret != 0))
+            return crun_make_error (err, 0, "could not unload handle_sev: `%s`", dlerror ());
           kconf->handle_sev = NULL;
         }
     }
@@ -1111,9 +1205,11 @@ libkrun_configure_container (void *cookie, enum handler_configure_phase phase,
       ret = libcrun_create_dev (container, devfd, -1, &nitro_device, is_user_ns, true, err);
       if (UNLIKELY (ret < 0))
         {
+          crun_error_release (err);
+
           ret = dlclose (kconf->handle_awsnitro);
-          if (UNLIKELY (ret < 0))
-            return ret;
+          if (UNLIKELY (ret != 0))
+            return crun_make_error (err, 0, "could not unload handle_awsnitro: `%s`", dlerror ());
           kconf->handle_awsnitro = NULL;
         }
     }

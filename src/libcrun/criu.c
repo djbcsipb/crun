@@ -36,6 +36,8 @@
 #  include "utils.h"
 #  include "cgroup.h"
 #  include "cgroup-utils.h"
+#  include "mount_flags.h"
+#  include "syscalls.h"
 
 #  ifndef STATIC
 #    include <dlfcn.h>
@@ -54,10 +56,63 @@
 #    define CLONE_NEWTIME 0x00000080 /* New time namespace */
 #  endif
 
-/* Defined in chroot_realpath.c  */
-char *chroot_realpath (const char *chroot, const char *path, char resolved_path[]);
+/* Map the public cgroups mode (enum libcrun_cr_cgroups_mode) onto the CRIU enum.  */
+static enum criu_cg_mode
+criu_cg_mode_from_public (int mode)
+{
+  switch (mode)
+    {
+    case LIBCRUN_CR_CG_MODE_IGNORE:
+      return CRIU_CG_MODE_IGNORE;
+    case LIBCRUN_CR_CG_MODE_FULL:
+      return CRIU_CG_MODE_FULL;
+    case LIBCRUN_CR_CG_MODE_STRICT:
+      return CRIU_CG_MODE_STRICT;
+    case LIBCRUN_CR_CG_MODE_DEFAULT:
+    case LIBCRUN_CR_CG_MODE_SOFT:
+    default:
+      /* Default to CRIU_CG_MODE_SOFT, just as runc.  */
+      return CRIU_CG_MODE_SOFT;
+    }
+}
+
+/* Map the public network lock method (enum libcrun_cr_network_lock_method) onto the
+   CRIU enum.  *LOCK is set to 0 when no explicit method must be set (CRIU default).
+   A method that this build cannot honor is an error, never a silent fallback to
+   the CRIU default.  */
+static int
+criu_network_lock_from_public (int method, int *lock, libcrun_error_t *err)
+{
+  switch (method)
+    {
+    case LIBCRUN_CR_NETWORK_LOCK_IPTABLES:
+      *lock = CRIU_NETWORK_LOCK_IPTABLES;
+      return 0;
+    case LIBCRUN_CR_NETWORK_LOCK_NFTABLES:
+      *lock = CRIU_NETWORK_LOCK_NFTABLES;
+      return 0;
+    case LIBCRUN_CR_NETWORK_LOCK_SKIP:
+#  if CRIU_NETWORK_LOCK_SKIP_SUPPORT
+      *lock = CRIU_NETWORK_LOCK_SKIP;
+      return 0;
+#  else
+      return crun_make_error (err, 0, "CRIU: the `skip` network lock method is not supported by this build");
+#  endif
+    case LIBCRUN_CR_NETWORK_LOCK_DEFAULT:
+      *lock = 0;
+      return 0;
+    default:
+      return crun_make_error (err, 0, "CRIU: unknown network lock method %d", method);
+    }
+}
 
 static const char *console_socket = NULL;
+static int status_fd = -1;
+
+/* The external mounts CRIU restores, and the flags the configuration asks
+   for each of them.  */
+static struct libcrun_mount_flags_s *restored_ext_mounts = NULL;
+static size_t n_restored_ext_mounts = 0;
 
 #  define LIBCRIU_MIN_VERSION 31500
 
@@ -71,6 +126,7 @@ struct libcriu_wrapper_s
   int (*criu_dump) (void);
   int (*criu_get_orphan_pts_master_fd) (void);
   int (*criu_init_opts) (void);
+  int (*criu_notify_pid) (criu_notify_arg_t na);
 #  ifdef CRIU_JOIN_NS_SUPPORT
   int (*criu_join_ns_add) (const char *ns, const char *ns_file, const char *extra_opt);
 #  endif
@@ -85,6 +141,7 @@ struct libcriu_wrapper_s
   int (*criu_set_log_file) (const char *log_file);
   void (*criu_set_log_level) (int log_level);
   void (*criu_set_leave_running) (bool leave_running);
+  void (*criu_set_lazy_pages) (bool lazy_pages);
   void (*criu_set_manage_cgroups) (bool manage);
   void (*criu_set_manage_cgroups_mode) (enum criu_cg_mode mode);
   int (*criu_set_network_lock) (enum criu_network_lock_method method);
@@ -92,6 +149,7 @@ struct libcriu_wrapper_s
   void (*criu_set_orphan_pts_master) (bool orphan_pts_master);
   void (*criu_set_images_dir_fd) (int fd);
   int (*criu_set_parent_images) (const char *path);
+  int (*criu_set_page_server_address_port) (const char *address, int port);
   void (*criu_set_pid) (int pid);
   int (*criu_set_root) (const char *root);
   int (*criu_add_cg_root) (const char *ctrl, const char *path);
@@ -122,6 +180,11 @@ cleanup_wrapper (void *p)
 #  endif
   free (*w);
   libcriu_wrapper = NULL;
+
+  while (n_restored_ext_mounts > 0)
+    free (restored_ext_mounts[--n_restored_ext_mounts].target);
+  free (restored_ext_mounts);
+  restored_ext_mounts = NULL;
 }
 
 #  define cleanup_wrapper __attribute__ ((cleanup (cleanup_wrapper)))
@@ -160,6 +223,7 @@ load_wrapper (struct libcriu_wrapper_s **wrapper_out, libcrun_error_t *err)
   LOAD_CRIU_FUNCTION (criu_dump, false);
   LOAD_CRIU_FUNCTION (criu_get_orphan_pts_master_fd, false);
   LOAD_CRIU_FUNCTION (criu_init_opts, false);
+  LOAD_CRIU_FUNCTION (criu_notify_pid, false);
 
 #  ifdef CRIU_JOIN_NS_SUPPORT
   /* criu_join_ns_add() API was introduced with CRIU version 3.16.1
@@ -180,6 +244,10 @@ load_wrapper (struct libcriu_wrapper_s **wrapper_out, libcrun_error_t *err)
   LOAD_CRIU_FUNCTION (criu_set_freeze_cgroup, false);
   LOAD_CRIU_FUNCTION (criu_set_images_dir_fd, false);
   LOAD_CRIU_FUNCTION (criu_set_leave_running, false);
+#  if ! defined STATIC || defined CRIU_LAZY_PAGES
+  /* criu_set_lazy_pages() is only available in newer libcriu versions.  */
+  LOAD_CRIU_FUNCTION (criu_set_lazy_pages, true);
+#  endif
   LOAD_CRIU_FUNCTION (criu_set_log_file, false);
   LOAD_CRIU_FUNCTION (criu_set_log_level, false);
   LOAD_CRIU_FUNCTION (criu_set_manage_cgroups, false);
@@ -188,6 +256,7 @@ load_wrapper (struct libcriu_wrapper_s **wrapper_out, libcrun_error_t *err)
   LOAD_CRIU_FUNCTION (criu_set_notify_cb, false);
   LOAD_CRIU_FUNCTION (criu_set_orphan_pts_master, false);
   LOAD_CRIU_FUNCTION (criu_set_parent_images, false);
+  LOAD_CRIU_FUNCTION (criu_set_page_server_address_port, false);
   LOAD_CRIU_FUNCTION (criu_set_pid, false);
   LOAD_CRIU_FUNCTION (criu_set_root, false);
   LOAD_CRIU_FUNCTION (criu_add_cg_root, false);
@@ -208,9 +277,38 @@ load_wrapper (struct libcriu_wrapper_s **wrapper_out, libcrun_error_t *err)
   return 0;
 }
 
-static int
-criu_notify (char *action, __attribute__ ((unused)) criu_notify_arg_t na)
+static void
+add_restored_ext_mount (const char *target, unsigned long flags)
 {
+  restored_ext_mounts = xrealloc (restored_ext_mounts, sizeof (*restored_ext_mounts) * (n_restored_ext_mounts + 1));
+  restored_ext_mounts[n_restored_ext_mounts].target = xstrdup (target);
+  restored_ext_mounts[n_restored_ext_mounts].flags = flags;
+  n_restored_ext_mounts++;
+}
+
+static int
+criu_notify (char *action, criu_notify_arg_t na)
+{
+  if (strcmp (action, "post-restore") == 0)
+    {
+      /* CRIU takes the source of an external mount from us and its flags
+       * from the image, i.e. from whatever mount was at that path in the
+       * container when it was checkpointed.  The container can move its
+       * mount points around, so before it is resumed make sure that each
+       * source is mounted with the restrictions the configuration asks for. */
+      libcrun_error_t tmp_err = NULL;
+      int ret;
+
+      ret = libcrun_restrict_mounts_in_container (libcriu_wrapper->criu_notify_pid (na), restored_ext_mounts,
+                                                  n_restored_ext_mounts, &tmp_err);
+      if (UNLIKELY (ret < 0))
+        {
+          libcrun_error (tmp_err->status, "cannot set the flags of the restored mounts: %s", tmp_err->msg);
+          libcrun_error_release (&tmp_err);
+          return ret;
+        }
+    }
+
   if (strncmp (action, "orphan-pts-master", 17) == 0)
     {
       /* CRIU sends us the master FD via the 'orphan-pts-master'
@@ -238,6 +336,19 @@ criu_notify (char *action, __attribute__ ((unused)) criu_notify_arg_t na)
           libcrun_error_release (&tmp_err);
           return ret;
         }
+    }
+  else if (strcmp (action, "status-ready") == 0 && status_fd >= 0)
+    {
+      /* CRIU is ready to serve memory pages to the lazy-pages daemon.
+       * Let the user know by writing a zero byte to the status fd. */
+      const char c = '\0';
+      ssize_t ret;
+
+      ret = TEMP_FAILURE_RETRY (write (status_fd, &c, 1));
+      close (status_fd);
+      status_fd = -1;
+      if (UNLIKELY (ret != 1))
+        return -1;
     }
   return 0;
 }
@@ -269,6 +380,281 @@ criu_check_mem_track (libcrun_error_t *err)
 }
 
 #  endif
+
+/* CRIU stores an external mount as the string "mnt[KEY]:VAL", looks it up
+   by prefix and reads "mnt[]" as a request to autodetect external mounts.
+   KEY comes from the container rootfs, refuse anything CRIU would not read
+   back as KEY, and the root of the container, which is not a bind mount.  */
+static int
+add_ext_bind_mount (const char *key, const char *val, libcrun_error_t *err)
+{
+  int ret;
+
+  if (UNLIKELY (key[0] != '/' || key[1] == '\0' || strstr (key, "]:") != NULL))
+    return crun_make_error (err, 0, "CRIU: invalid external mount destination `%s`", key);
+
+  ret = libcriu_wrapper->criu_add_ext_mount (key, val);
+  if (UNLIKELY (ret < 0))
+    return crun_make_error (err, -ret, "CRIU: failed adding external mount to `%s`", val);
+
+  return 0;
+}
+
+static int
+setup_lazy_pages (libcrun_error_t *err)
+{
+  if (libcriu_wrapper->criu_set_lazy_pages == NULL)
+    return crun_make_error (err, 0, "lazy pages are not supported by this libcriu version");
+
+#  ifdef CRIU_PRE_DUMP_SUPPORT
+  {
+    struct criu_feature_check features = { 0 };
+    int ret;
+
+    features.lazy_pages = true;
+
+    ret = libcriu_wrapper->criu_feature_check (&features, sizeof (features));
+    if (UNLIKELY (ret < 0))
+      return crun_make_error (err, 0, "CRIU feature checking failed: %d", ret);
+
+    if (! features.lazy_pages)
+      return crun_make_error (err, 0, "CRIU lazy pages not supported");
+  }
+#  endif
+
+  libcriu_wrapper->criu_set_lazy_pages (true);
+  return 0;
+}
+
+static bool
+devices_are_bind_mounted (runtime_spec_schema_config_schema *def, libcrun_container_t *container)
+{
+  size_t i;
+
+  if (! container->host_uid && ! has_user_namespace (def))
+    return false;
+
+  for (i = 0; i < def->mounts_len; i++)
+    if (path_is_slash_dev (def->mounts[i]->destination) && is_bind_mount (def->mounts[i], NULL, NULL))
+      return false;
+
+  return true;
+}
+
+/* With a user namespace the devices cannot be created with mknod, so they
+   are bind mounted: the devices in the configuration from a tmpfs where
+   they are created outside of the user namespace, the other ones from the
+   host.  Tell CRIU about these bind mounts.  On restore, DEVS_PATH is the
+   tmpfs with the devices in the configuration, or NULL to take them from
+   the host.  */
+static int
+register_devices_mounts (runtime_spec_schema_config_schema *def, struct libcriu_wrapper_s *libcriu_wrapper,
+                         bool is_restore, const char *devs_path, libcrun_error_t *err)
+{
+  struct device_s *it;
+  size_t i;
+  int ret;
+
+  for (i = 0; def->linux && i < def->linux->devices_len; i++)
+    {
+      const char *path = def->linux->devices[i]->path;
+      cleanup_free char *source = NULL;
+
+      if (devs_path)
+        {
+          xasprintf (&source, "%s/%zu", devs_path, i);
+          if (access (source, F_OK) < 0)
+            {
+              free (source);
+              source = NULL;
+            }
+        }
+
+      ret = libcriu_wrapper->criu_add_ext_mount (path, source ? source : path);
+      if (UNLIKELY (ret < 0))
+        return crun_make_error (err, -ret, "CRIU: failed adding external mount for device `%s`", path);
+      if (is_restore)
+        add_restored_ext_mount (path, MS_NOSUID | MS_NOEXEC);
+    }
+
+  for (it = needed_devs; it->path; it++)
+    {
+      if (libcrun_is_configured_device (def, it->path))
+        continue;
+
+      ret = libcriu_wrapper->criu_add_ext_mount (it->path, it->path);
+      if (UNLIKELY (ret < 0))
+        return crun_make_error (err, -ret, "CRIU: failed adding external mount for device `%s`", it->path);
+      if (is_restore)
+        add_restored_ext_mount (it->path, MS_NOSUID | MS_NOEXEC);
+    }
+
+  return 0;
+}
+
+/* Store in OUT the path of FD relative to ROOTFD, the root it was opened in.  */
+static int
+get_path_in_root (int rootfd, int fd, char **out, libcrun_error_t *err)
+{
+  cleanup_free char *root = NULL;
+  cleanup_free char *path = NULL;
+  proc_fd_path_t fd_path;
+  size_t root_len;
+  ssize_t len;
+
+  get_proc_self_fd_path (fd_path, rootfd);
+  len = safe_readlinkat (AT_FDCWD, fd_path, &root, 0, err);
+  if (UNLIKELY (len < 0))
+    return len;
+
+  get_proc_self_fd_path (fd_path, fd);
+  len = safe_readlinkat (AT_FDCWD, fd_path, &path, 0, err);
+  if (UNLIKELY (len < 0))
+    return len;
+
+  root_len = strcmp (root, "/") == 0 ? 0 : strlen (root);
+  if (strncmp (path, root, root_len) != 0 || (path[root_len] != '/' && path[root_len] != '\0'))
+    return crun_make_error (err, 0, "`%s` is not under `%s`", path, root);
+
+  *out = xstrdup (path[root_len] ? path + root_len : "/");
+  return 0;
+}
+
+/* Tell CRIU about the bind mount MNT, at MOUNT_POINT in the container.  CRIU
+   knows it by its mount point, that is where the kernel resolved the
+   destination: following the links in the rootfs and in the earlier mounts.
+   On restore, a relative source is relative to BUNDLE.  */
+static int
+register_bind_mount (runtime_spec_schema_defs_mount *mnt, const char *mount_point, bool is_restore,
+                     const char *bundle, libcrun_error_t *err)
+{
+  cleanup_free char *abs_source = NULL;
+  const char *source = mnt->source;
+  unsigned long flags = 0;
+  size_t i;
+  int ret;
+
+  if (! is_restore)
+    source = mount_point;
+  else if (source && source[0] != '/')
+    {
+      /* CRIU would resolve it relative to its own working directory.  */
+      ret = append_paths (&abs_source, err, bundle, source, NULL);
+      if (UNLIKELY (ret < 0))
+        return ret;
+      source = abs_source;
+    }
+
+  ret = add_ext_bind_mount (mount_point, source, err);
+  if (UNLIKELY (ret < 0))
+    return ret;
+
+  if (! is_restore)
+    return 0;
+
+  for (i = 0; i < mnt->options_len; i++)
+    {
+      const struct propagation_flags_s *prop = NULL;
+
+      if (mnt->options[i])
+        prop = libcrun_str2mount_flags (mnt->options[i]);
+      if (prop && ! prop->clear)
+        flags |= prop->flags;
+    }
+  add_restored_ext_mount (mount_point, flags);
+  return 0;
+}
+
+/* Return the tmpfs in the configuration that DEST is on, or NULL.  */
+static runtime_spec_schema_defs_mount *
+get_parent_tmpfs (runtime_spec_schema_config_schema *def, const char *dest)
+{
+  size_t dest_len = strlen (dest);
+  size_t i;
+
+  for (i = 0; i < def->mounts_len; i++)
+    {
+      const char *tmpfs = def->mounts[i]->destination;
+      size_t len = strlen (tmpfs);
+
+      if (def->mounts[i]->type == NULL || strcmp (def->mounts[i]->type, "tmpfs") != 0)
+        continue;
+      if (len < dest_len && dest[len] == '/' && strncmp (dest, tmpfs, len) == 0)
+        return def->mounts[i];
+    }
+  return NULL;
+}
+
+/* Store in OUT the mount point of MNT, resolving its destination in ROOTFD as
+   the kernel did when it was mounted: following the links in the rootfs and
+   in the earlier bind mounts.  It is the same on checkpoint, in the running
+   container, and on restore, where the bind mounts are done again in the same
+   order.  The content of a tmpfs is not there on restore, so in a tmpfs the
+   rest of the destination is not resolved.  */
+static int
+get_mount_point (runtime_spec_schema_config_schema *def, runtime_spec_schema_defs_mount *mnt, int rootfd,
+                 const char *root, char **out, libcrun_error_t *err)
+{
+  runtime_spec_schema_defs_mount *tmpfs = get_parent_tmpfs (def, mnt->destination);
+  cleanup_free char *resolved = NULL;
+  cleanup_close int fd = -1;
+  int ret;
+
+  fd = safe_openat (rootfd, root, tmpfs ? tmpfs->destination : mnt->destination, O_PATH | O_CLOEXEC, 0, err);
+  if (UNLIKELY (fd < 0))
+    return crun_error_wrap (err, "unable to resolve external bind mount `%s`", mnt->destination);
+
+  ret = get_path_in_root (rootfd, fd, &resolved, err);
+  if (UNLIKELY (ret < 0))
+    return ret;
+
+  if (tmpfs == NULL)
+    {
+      *out = resolved;
+      resolved = NULL;
+      return 0;
+    }
+
+  xasprintf (out, "%s%s", strcmp (resolved, "/") == 0 ? "" : resolved, mnt->destination + strlen (tmpfs->destination));
+  return 0;
+}
+
+/* Tell CRIU about the bind mounts of the running container PID.  */
+static int
+register_bind_mounts_in_container (pid_t pid, runtime_spec_schema_config_schema *def, libcrun_error_t *err)
+{
+  cleanup_close int rootfd = -1;
+  char root_path[64];
+  size_t i;
+  int ret;
+
+  snprintf (root_path, sizeof (root_path), "/proc/%d/root", pid);
+  rootfd = open (root_path, O_PATH | O_DIRECTORY | O_CLOEXEC);
+  if (UNLIKELY (rootfd < 0))
+    return crun_make_error (err, errno, "open `%s`", root_path);
+
+  for (i = 0; i < def->mounts_len; i++)
+    {
+      cleanup_free char *mount_point = NULL;
+      bool nofollow = false;
+
+      if (! is_bind_mount (def->mounts[i], NULL, &nofollow))
+        continue;
+
+      if (nofollow)
+        return crun_make_error (err, 0, "CRIU does not support `src-nofollow` for bind mounts");
+
+      ret = get_mount_point (def, def->mounts[i], rootfd, root_path, &mount_point, err);
+      if (UNLIKELY (ret < 0))
+        return ret;
+
+      ret = register_bind_mount (def->mounts[i], mount_point, false, NULL, err);
+      if (UNLIKELY (ret < 0))
+        return ret;
+    }
+
+  return 0;
+}
 
 static int
 register_masked_paths_mounts (runtime_spec_schema_config_schema *def, libcrun_container_t *container,
@@ -305,6 +691,9 @@ register_masked_paths_mounts (runtime_spec_schema_config_schema *def, libcrun_co
           ret = libcriu_wrapper->criu_add_ext_mount (def->linux->masked_paths[i], empty_dir_path);
           if (UNLIKELY (ret < 0))
             return crun_make_error (err, -ret, "CRIU: failed adding external mount for masked directory `%s`", def->linux->masked_paths[i]);
+
+          if (is_restore)
+            add_restored_ext_mount (def->linux->masked_paths[i], MS_RDONLY);
         }
       else if (S_ISREG (statbuf.st_mode))
         {
@@ -312,6 +701,9 @@ register_masked_paths_mounts (runtime_spec_schema_config_schema *def, libcrun_co
           ret = libcriu_wrapper->criu_add_ext_mount (def->linux->masked_paths[i], bind_target);
           if (UNLIKELY (ret < 0))
             return crun_make_error (err, -ret, "CRIU: failed adding external mount to `%s`", bind_target);
+
+          if (is_restore)
+            add_restored_ext_mount (def->linux->masked_paths[i], MS_RDONLY);
         }
     }
 
@@ -518,13 +910,13 @@ static void
 show_criu_log (const char *work_path, const char *log)
 {
   cleanup_free char *log_path = NULL;
-  libcrun_error_t *tmp_err = NULL;
+  libcrun_error_t tmp_err = NULL;
   char line[1024];
   FILE *f;
 
-  if (UNLIKELY (append_paths (&log_path, tmp_err, work_path, log, NULL)) < 0)
+  if (UNLIKELY (append_paths (&log_path, &tmp_err, work_path, log, NULL) < 0))
     {
-      crun_error_release (tmp_err);
+      crun_error_release (&tmp_err);
       return;
     }
 
@@ -638,7 +1030,9 @@ libcrun_container_checkpoint_linux_criu (libcrun_container_status_t *status, lib
 
   /* Set up logging. */
   libcriu_wrapper->criu_set_log_level (4);
-  libcriu_wrapper->criu_set_log_file (CRIU_CHECKPOINT_LOG_FILE);
+  ret = libcriu_wrapper->criu_set_log_file (CRIU_CHECKPOINT_LOG_FILE);
+  if (UNLIKELY (ret < 0))
+    return crun_make_error (err, -ret, "error setting CRIU log file to `%s`", CRIU_CHECKPOINT_LOG_FILE);
 
   /* Set up CRIU config file */
   if (UNLIKELY (handle_criu_config_file (container, err)))
@@ -653,6 +1047,16 @@ libcrun_container_checkpoint_linux_criu (libcrun_container_status_t *status, lib
   ret = setup_criu_work_dir (cr_options, &work_fd, err);
   if (UNLIKELY (ret < 0))
     return ret;
+
+  if (cr_options->page_server_address != NULL)
+    {
+      ret = libcriu_wrapper->criu_set_page_server_address_port (cr_options->page_server_address,
+                                                                cr_options->page_server_port);
+      /* libcriu versions before criu_set_lazy_pages() was added always
+       * return -ENOMEM, so only check the result with a newer libcriu.  */
+      if (UNLIKELY (ret < 0 && libcriu_wrapper->criu_set_lazy_pages != NULL))
+        return crun_make_error (err, -ret, "CRIU: failed setting page server address");
+    }
 
 #  ifdef CRIU_PRE_DUMP_SUPPORT
 
@@ -736,37 +1140,20 @@ libcrun_container_checkpoint_linux_criu (libcrun_container_status_t *status, lib
         return ret;
     }
 
-  /* Tell CRIU about external bind mounts. */
-  for (i = 0; i < def->mounts_len; i++)
-    {
-      bool nofollow = false;
-      if (is_bind_mount (def->mounts[i], NULL, &nofollow))
-        {
-          /* We need to resolve mount destination inside container's root for CRIU to handle. */
-          char buf[PATH_MAX];
-          const char *dest_in_root;
-
-          if (nofollow)
-            return crun_make_error (err, 0, "CRIU does not support `src-nofollow` for bind mounts");
-
-          dest_in_root = chroot_realpath (status->rootfs, def->mounts[i]->destination, buf);
-          if (UNLIKELY (dest_in_root == NULL))
-            return crun_make_error (err, errno, "unable to resolve external bind mount `%s` under rootfs", def->mounts[i]->destination);
-
-          /* When the rootfs is "/" or not set, chroot_realpath returns the
-             path unchanged, so strip the prefix only when it is there.  */
-          if (has_prefix (dest_in_root, status->rootfs))
-            dest_in_root += safe_strlen (status->rootfs);
-
-          ret = libcriu_wrapper->criu_add_ext_mount (dest_in_root, dest_in_root);
-          if (UNLIKELY (ret < 0))
-            return crun_make_error (err, -ret, "CRIU: failed adding external mount to `%s`", def->mounts[i]->destination);
-        }
-    }
+  ret = register_bind_mounts_in_container (status->pid, def, err);
+  if (UNLIKELY (ret < 0))
+    return ret;
 
   ret = register_masked_paths_mounts (def, container, libcriu_wrapper, false, err);
   if (UNLIKELY (ret < 0))
     return ret;
+
+  if (devices_are_bind_mounted (def, container))
+    {
+      ret = register_devices_mounts (def, libcriu_wrapper, false, NULL, err);
+      if (UNLIKELY (ret < 0))
+        return ret;
+    }
 
   /* CRIU tries to checkpoint and restore all namespaces. However,
    * namespaces could be shared between containers in a pod.
@@ -847,19 +1234,49 @@ libcrun_container_checkpoint_linux_criu (libcrun_container_status_t *status, lib
   libcriu_wrapper->criu_set_tcp_established (cr_options->tcp_established);
   libcriu_wrapper->criu_set_file_locks (cr_options->file_locks);
   libcriu_wrapper->criu_set_orphan_pts_master (true);
-  if (cr_options->manage_cgroups_mode == -1)
-    /* Defaulting to CRIU_CG_MODE_SOFT just as runc */
-    libcriu_wrapper->criu_set_manage_cgroups_mode (CRIU_CG_MODE_SOFT);
-  else
-    libcriu_wrapper->criu_set_manage_cgroups_mode (cr_options->manage_cgroups_mode);
+  libcriu_wrapper->criu_set_manage_cgroups_mode (criu_cg_mode_from_public (cr_options->manage_cgroups_mode));
 
   libcriu_wrapper->criu_set_manage_cgroups (true);
 
-  if (libcriu_wrapper->criu_set_network_lock && cr_options->network_lock_method > 0)
+  if (libcriu_wrapper->criu_set_network_lock)
     {
-      ret = libcriu_wrapper->criu_set_network_lock (cr_options->network_lock_method);
+      int lock = 0;
+
+      ret = criu_network_lock_from_public (cr_options->network_lock_method, &lock, err);
       if (UNLIKELY (ret < 0))
-        return crun_make_error (err, 0, "CRIU: failed setting network lock");
+        return ret;
+
+      if (lock > 0)
+        {
+          ret = libcriu_wrapper->criu_set_network_lock (lock);
+          if (UNLIKELY (ret < 0))
+            return crun_make_error (err, 0, "CRIU: failed setting network lock");
+        }
+    }
+
+  if (cr_options->lazy_pages)
+    {
+      ret = setup_lazy_pages (err);
+      if (UNLIKELY (ret < 0))
+        return ret;
+    }
+
+  status_fd = -1;
+  if (cr_options->status_fd >= 0)
+    {
+      int flags;
+
+      if (UNLIKELY (! cr_options->lazy_pages))
+        return crun_make_error (err, 0, "status fd can only be used with lazy pages");
+
+      flags = fcntl (cr_options->status_fd, F_GETFL);
+      if (UNLIKELY (flags < 0))
+        return crun_make_error (err, errno, "invalid status fd `%d`", cr_options->status_fd);
+      if (UNLIKELY ((flags & O_ACCMODE) == O_RDONLY))
+        return crun_make_error (err, 0, "invalid status fd `%d`: not writable", cr_options->status_fd);
+
+      status_fd = cr_options->status_fd;
+      libcriu_wrapper->criu_set_notify_cb (criu_notify);
     }
 
   ret = libcriu_wrapper->criu_dump ();
@@ -872,45 +1289,84 @@ libcrun_container_checkpoint_linux_criu (libcrun_container_status_t *status, lib
   return 0;
 }
 
+/* Whether the options of MNT ask for a read-only mount.  */
+static bool
+is_read_only_mount (runtime_spec_schema_defs_mount *mnt)
+{
+  bool read_only = false;
+  size_t i;
+
+  for (i = 0; i < mnt->options_len; i++)
+    {
+      const struct propagation_flags_s *prop;
+
+      if (mnt->options[i] == NULL)
+        continue;
+
+      prop = libcrun_str2mount_flags (mnt->options[i]);
+      if (prop && (prop->flags & MS_RDONLY))
+        read_only = ! prop->clear;
+    }
+
+  return read_only;
+}
+
+/* Bind mount SOURCE read-only on DST_FD, without a window where it is
+   writable.  Return 1 if it was mounted, 0 if the kernel cannot do that.  */
 static int
-prepare_restore_mounts_internal (runtime_spec_schema_config_schema *def, char *root, const char **mounted,
-                                 size_t *n_mounted, libcrun_error_t *err)
+bind_mount_read_only (const char *source, int dst_fd, libcrun_error_t *err)
+{
+#  ifdef HAVE_NEW_MOUNT_API
+  cleanup_close int mount_fd = -1;
+
+  mount_fd = get_bind_mount (AT_FDCWD, source, false, true, false, 0, err);
+  if (UNLIKELY (mount_fd < 0))
+    {
+      if (crun_error_get_errno (err) != ENOSYS)
+        return mount_fd;
+      crun_error_release (err);
+      return 0;
+    }
+
+  if (UNLIKELY (syscall_move_mount (mount_fd, "", dst_fd, "", MOVE_MOUNT_F_EMPTY_PATH | MOVE_MOUNT_T_EMPTY_PATH) < 0))
+    return crun_make_error (err, errno, "move_mount `%s`", source);
+
+  return 1;
+#  else
+  (void) source;
+  (void) dst_fd;
+  (void) err;
+  (void) syscall_move_mount;
+  return 0;
+#  endif
+}
+
+static int
+prepare_restore_mounts_internal (runtime_spec_schema_config_schema *def, char *root, const char *bundle,
+                                 const char **mounted, size_t *n_mounted, libcrun_error_t *err)
 {
   uint32_t i;
+  int ret;
 
   /* Go through all mountpoints to be able to recreate missing mountpoints. */
   for (i = 0; i < def->mounts_len; i++)
     {
       char *dest = def->mounts[i]->destination;
       char *type = def->mounts[i]->type;
+      cleanup_free char *mount_point = NULL;
       cleanup_close int root_fd = -1;
+      cleanup_close int dst_fd = -1;
+      proc_fd_path_t fd_path;
       bool nofollow = false;
-      bool on_tmpfs = false;
+      bool on_tmpfs;
       int is_dir = 1;
-      size_t j;
 
       /* cgroup restore should be handled by CRIU itself */
       if (type && (strcmp (type, "cgroup") == 0 || strcmp (type, "cgroup2") == 0))
         continue;
 
-      /* Check if the mountpoint is on a tmpfs. CRIU restores
-       * all tmpfs. We do need to recreate directories on a tmpfs. */
-      size_t dest_len = strlen (dest);
-      for (j = 0; j < def->mounts_len; j++)
-        {
-          if (def->mounts[j]->type == NULL || strcmp (def->mounts[j]->type, "tmpfs") != 0)
-            continue;
-          size_t mount_len = strlen (def->mounts[j]->destination);
-          if (mount_len < dest_len && dest[mount_len] == '/' && strncmp (dest, def->mounts[j]->destination, mount_len) == 0)
-            {
-              /* This is a mountpoint which is on a tmpfs.*/
-              on_tmpfs = true;
-              break;
-            }
-        }
-
-      if (on_tmpfs)
-        continue;
+      /* CRIU restores all tmpfs.  We do need to recreate directories on a tmpfs. */
+      on_tmpfs = get_parent_tmpfs (def, dest) != NULL;
 
       /* For bind mounts check if the source is a file or a directory. */
       if (is_bind_mount (def->mounts[i], NULL, &nofollow))
@@ -927,44 +1383,60 @@ prepare_restore_mounts_internal (runtime_spec_schema_config_schema *def, char *r
       if (UNLIKELY (root_fd == -1))
         return crun_make_error (err, errno, "error opening container root directory `%s`", root);
 
-      if (is_dir)
+      if (! on_tmpfs)
         {
-          int ret;
-
-          ret = crun_safe_ensure_directory_at (root_fd, root, dest, 0755, err);
-          if (UNLIKELY (ret < 0))
-            return ret;
+          /* As the container creation does, see process_single_mount.  */
+          dst_fd = crun_safe_create_and_open_ref_at (is_dir, root_fd, root, dest, 0755, err);
+          if (UNLIKELY (dst_fd < 0))
+            return dst_fd;
         }
-      else
-        {
-          int ret;
 
-          ret = crun_safe_ensure_file_at (root_fd, root, dest, 0755, err);
-          if (UNLIKELY (ret < 0))
-            return ret;
-        }
+      if (! is_bind_mount (def->mounts[i], NULL, NULL))
+        continue;
+
+      ret = get_mount_point (def, def->mounts[i], root_fd, root, &mount_point, err);
+      if (UNLIKELY (ret < 0))
+        return ret;
+
+      ret = register_bind_mount (def->mounts[i], mount_point, true, bundle, err);
+      if (UNLIKELY (ret < 0))
+        return ret;
+
+      if (on_tmpfs)
+        continue;
 
       /* Mount a bind mount source now, so that the mountpoints of the
        * mounts inside it (e.g. a nested bind mount) are created in the
        * source, where CRIU expects them.  This also happens during the
-       * initial container creation, as the mounts are done in order.  */
-      if (is_bind_mount (def->mounts[i], NULL, &nofollow))
+       * initial container creation, as the mounts are done in order.
+       * Not recursive: the source might contain ROOT itself (e.g. when
+       * it is the bundle directory), and it is not needed anyway.
+       *
+       * A read-only bind mount is needed too, as the destination of a
+       * later mount can go through a link in it, but it must be read-only
+       * from the start: the rootfs is controlled by the container, which
+       * can turn the destination of a later mount into a symlink pointing
+       * inside the read-only mount, so that the missing mountpoint would
+       * be created in its source.  Any mountpoint inside it must already
+       * exist in the source, as crun cannot create it there when the
+       * container is created either.  Without the new mount API it is
+       * skipped, and the restore of such a later mount fails.  */
+      if (is_read_only_mount (def->mounts[i]))
         {
-          cleanup_close int dst_fd = -1;
-          proc_fd_path_t fd_path;
-
-          dst_fd = safe_openat (root_fd, root, dest, O_PATH | O_CLOEXEC, 0, err);
-          if (UNLIKELY (dst_fd < 0))
-            return dst_fd;
-
-          /* Not recursive: the source might contain ROOT itself (e.g. when
-           * it is the bundle directory), and it is not needed anyway.  */
+          ret = bind_mount_read_only (def->mounts[i]->source, dst_fd, err);
+          if (UNLIKELY (ret < 0))
+            return crun_error_wrap (err, "bind mount `%s` to `%s`", def->mounts[i]->source, dest);
+          if (ret == 0)
+            continue;
+        }
+      else
+        {
           get_proc_self_fd_path (fd_path, dst_fd);
           if (UNLIKELY (mount (def->mounts[i]->source, fd_path, NULL, MS_BIND, NULL) < 0))
             return crun_make_error (err, errno, "bind mount `%s` to `%s`", def->mounts[i]->source, dest);
-
-          mounted[(*n_mounted)++] = dest;
         }
+
+      mounted[(*n_mounted)++] = dest;
     }
 
   return 0;
@@ -1083,16 +1555,17 @@ criu_restore_child_in_cgroup (const char *cgroup_path, int *criu_ret, libcrun_er
 }
 
 /* Recreate the mountpoints which do not exist in the container rootfs
- * mounted at ROOT, the same way it is done on the container creation.  */
+ * mounted at ROOT, the same way it is done on the container creation,
+ * and tell CRIU about the bind mounts there.  */
 static int
-prepare_restore_mounts (runtime_spec_schema_config_schema *def, char *root, libcrun_error_t *err)
+prepare_restore_mounts (runtime_spec_schema_config_schema *def, char *root, const char *bundle, libcrun_error_t *err)
 {
   cleanup_free const char **mounted = xmalloc0 (sizeof (char *) * (def->mounts_len + 1));
   cleanup_close int root_fd = -1;
   size_t n_mounted = 0;
   int ret;
 
-  ret = prepare_restore_mounts_internal (def, root, mounted, &n_mounted, err);
+  ret = prepare_restore_mounts_internal (def, root, bundle, mounted, &n_mounted, err);
 
   /* The bind mounts done above are only needed to create the mountpoints,
    * and CRIU restores the mounts itself, so undo them, in reverse order. */
@@ -1129,6 +1602,8 @@ libcrun_container_restore_linux_criu (libcrun_container_status_t *status, libcru
   cleanup_close int inherit_new_pid_fd = -1;
   cleanup_close int image_fd = -1;
   cleanup_free char *root = NULL;
+  cleanup_free char *devs = NULL;
+  bool devs_mounted = false;
   cleanup_free char *bundle_cleanup = NULL;
   cleanup_free char *own_cgroups = NULL;
   cleanup_close int work_fd = -1;
@@ -1206,6 +1681,13 @@ libcrun_container_restore_linux_criu (libcrun_container_status_t *status, libcru
     json_object_put (doc);
   }
 
+  /* Our std streams are the new external descriptors, as CRIU connects the
+   * inherited pipes to them.  Record them now: once the container is
+   * restored it is already running, and /proc/PID/fd is under its control. */
+  ret = libcrun_save_external_descriptors (container, err);
+  if (UNLIKELY (ret < 0))
+    return ret;
+
   ret = setup_criu_work_dir (cr_options, &work_fd, err);
   if (UNLIKELY (ret < 0))
     return ret;
@@ -1228,46 +1710,6 @@ libcrun_container_restore_linux_criu (libcrun_container_status_t *status, libcru
   bundle_cleanup = realpath (status->bundle, NULL);
   if (UNLIKELY (bundle_cleanup == NULL))
     bundle_cleanup = xstrdup (status->bundle);
-
-  /* Tell CRIU about external bind mounts. */
-  for (i = 0; i < def->mounts_len; i++)
-    {
-      bool nofollow = false;
-      if (is_bind_mount (def->mounts[i], NULL, &nofollow))
-        {
-          /* We need to resolve mount destination inside container's root for CRIU to handle. */
-          char buf[PATH_MAX];
-          const char *dest_in_root;
-          const char *source = def->mounts[i]->source;
-          cleanup_free char *abs_source = NULL;
-
-          if (nofollow)
-            return crun_make_error (err, 0, "CRIU does not support `src-nofollow` for bind mounts");
-
-          dest_in_root = chroot_realpath (status->rootfs, def->mounts[i]->destination, buf);
-          if (UNLIKELY (dest_in_root == NULL))
-            return crun_make_error (err, errno, "unable to resolve external bind mount destination `%s` under rootfs", def->mounts[i]->destination);
-
-          /* When the rootfs is "/" or not set, chroot_realpath returns the
-             path unchanged, so strip the prefix only when it is there.  */
-          if (has_prefix (dest_in_root, status->rootfs))
-            dest_in_root += safe_strlen (status->rootfs);
-
-          /* A relative source is relative to the bundle, while CRIU would
-             resolve it relative to its own working directory.  */
-          if (source && source[0] != '/')
-            {
-              ret = append_paths (&abs_source, err, bundle_cleanup, source, NULL);
-              if (UNLIKELY (ret < 0))
-                return ret;
-              source = abs_source;
-            }
-
-          ret = libcriu_wrapper->criu_add_ext_mount (dest_in_root, source);
-          if (UNLIKELY (ret < 0))
-            return crun_make_error (err, -ret, "CRIU: failed adding external mount to `%s`", source);
-        }
-    }
 
   ret = register_masked_paths_mounts (def, container, libcriu_wrapper, true, err);
   if (UNLIKELY (ret < 0))
@@ -1296,9 +1738,37 @@ libcrun_container_restore_linux_criu (libcrun_container_status_t *status, libcru
    * even if it marked as read-only, but runc already modifies
    * the rootfs in the same way. */
 
-  ret = prepare_restore_mounts (def, root, err);
+  ret = prepare_restore_mounts (def, root, bundle_cleanup, err);
   if (UNLIKELY (ret < 0))
     goto out_umount;
+
+  if (devices_are_bind_mounted (def, container))
+    {
+      if (def->linux && def->linux->devices_len > 0 && geteuid () == 0)
+        {
+          ret = append_paths (&devs, err, bundle_cleanup, "criu-devs", NULL);
+          if (UNLIKELY (ret < 0))
+            goto out_umount;
+
+          ret = mkdir (devs, 0700);
+          if (UNLIKELY (ret < 0))
+            {
+              ret = crun_make_error (err, errno, "mkdir `%s`", devs);
+              free (devs);
+              devs = NULL;
+              goto out_umount;
+            }
+
+          ret = libcrun_create_devices_tmpfs (container, devs, err);
+          if (UNLIKELY (ret < 0))
+            goto out_umount;
+          devs_mounted = ret > 0;
+        }
+
+      ret = register_devices_mounts (def, libcriu_wrapper, true, devs_mounted ? devs : NULL, err);
+      if (UNLIKELY (ret < 0))
+        goto out_umount;
+    }
 
   ret = libcriu_wrapper->criu_set_root (root);
   if (UNLIKELY (ret != 0))
@@ -1429,6 +1899,13 @@ libcrun_container_restore_linux_criu (libcrun_container_status_t *status, libcru
   libcriu_wrapper->criu_set_file_locks (cr_options->file_locks);
   libcriu_wrapper->criu_set_orphan_pts_master (true);
 
+  if (cr_options->lazy_pages)
+    {
+      ret = setup_lazy_pages (err);
+      if (UNLIKELY (ret < 0))
+        goto out_umount;
+    }
+
   if (status->cgroup_path)
     {
       cgroup_mode = libcrun_get_cgroup_mode (err);
@@ -1454,20 +1931,25 @@ libcrun_container_restore_linux_criu (libcrun_container_status_t *status, libcru
         }
     }
 
-  if (cr_options->manage_cgroups_mode == -1)
-    /* Defaulting to CRIU_CG_MODE_SOFT just as runc */
-    libcriu_wrapper->criu_set_manage_cgroups_mode (CRIU_CG_MODE_SOFT);
-  else
-    libcriu_wrapper->criu_set_manage_cgroups_mode (cr_options->manage_cgroups_mode);
+  libcriu_wrapper->criu_set_manage_cgroups_mode (criu_cg_mode_from_public (cr_options->manage_cgroups_mode));
   libcriu_wrapper->criu_set_manage_cgroups (true);
 
-  if (libcriu_wrapper->criu_set_network_lock && cr_options->network_lock_method > 0)
+  if (libcriu_wrapper->criu_set_network_lock)
     {
-      ret = libcriu_wrapper->criu_set_network_lock (cr_options->network_lock_method);
+      int lock = 0;
+
+      ret = criu_network_lock_from_public (cr_options->network_lock_method, &lock, err);
       if (UNLIKELY (ret < 0))
+        goto out_umount;
+
+      if (lock > 0)
         {
-          ret = crun_make_error (err, 0, "CRIU: failed setting network lock");
-          goto out_umount;
+          ret = libcriu_wrapper->criu_set_network_lock (lock);
+          if (UNLIKELY (ret < 0))
+            {
+              ret = crun_make_error (err, 0, "CRIU: failed setting network lock");
+              goto out_umount;
+            }
         }
     }
 
@@ -1532,10 +2014,16 @@ libcrun_container_restore_linux_criu (libcrun_container_status_t *status, libcru
   /* Update the status struct with the newly allocated PID. This will
    * be necessary later when moving the process into its cgroup. */
   status->pid = ret;
-
-  ret = libcrun_save_external_descriptors (container, ret, err);
+  ret = 0;
 
 out_umount:
+  if (devs)
+    {
+      if (devs_mounted)
+        umount2 (devs, MNT_DETACH);
+      rmdir (devs);
+    }
+
   ret_out = umount (root);
   if (UNLIKELY (ret_out == -1))
     {

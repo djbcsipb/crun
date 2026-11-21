@@ -248,6 +248,64 @@ libcrun_cgroup_destroy (struct libcrun_cgroup_status *cgroup_status, libcrun_err
   return cgroup_manager->destroy_cgroup (cgroup_status, err);
 }
 
+/* On cgroup v2, the CPU quota and period are set together, via cpu.max.
+   If an update sets only one of them, take the other one from the current
+   cpu.max, so it is kept (rather than reset to the default).  */
+static int
+complete_cpu_max (const char *path, runtime_spec_schema_config_linux_resources *resources, libcrun_error_t *err)
+{
+  runtime_spec_schema_config_linux_resources_cpu *cpu;
+  cleanup_free char *cpu_max_path = NULL;
+  cleanup_free char *content = NULL;
+  bool has_period;
+  uint64_t period;
+  int64_t quota;
+  int cgroup_mode;
+  int ret;
+
+  if (resources == NULL || resources->cpu == NULL)
+    return 0;
+
+  cpu = resources->cpu;
+  if (cpu->quota_present == cpu->period_present)
+    return 0;
+
+  cgroup_mode = libcrun_get_cgroup_mode (err);
+  if (UNLIKELY (cgroup_mode < 0))
+    return cgroup_mode;
+  if (cgroup_mode != CGROUP_MODE_UNIFIED)
+    return 0;
+
+  ret = append_paths (&cpu_max_path, err, CGROUP_ROOT, path, "cpu.max", NULL);
+  if (UNLIKELY (ret < 0))
+    return ret;
+
+  ret = read_all_file (cpu_max_path, &content, NULL, err);
+  if (UNLIKELY (ret < 0))
+    {
+      /* The cpu controller might not be enabled; nothing to keep then.  */
+      crun_error_release (err);
+      return 0;
+    }
+
+  ret = parse_cpu_max (content, &quota, &period, &has_period, err);
+  if (UNLIKELY (ret < 0))
+    return ret;
+
+  if (! cpu->quota_present)
+    {
+      cpu->quota = quota;
+      cpu->quota_present = 1;
+    }
+  else if (has_period)
+    {
+      cpu->period = period;
+      cpu->period_present = 1;
+    }
+
+  return 0;
+}
+
 int
 libcrun_update_cgroup_resources (struct libcrun_cgroup_status *cgroup_status,
                                  const char *state_root,
@@ -261,6 +319,14 @@ libcrun_update_cgroup_resources (struct libcrun_cgroup_status *cgroup_status,
   if (UNLIKELY (ret < 0))
     return ret;
 
+  ret = check_memory_before_update (cgroup_status->path, resources, err);
+  if (UNLIKELY (ret < 0))
+    return ret;
+
+  ret = complete_cpu_max (cgroup_status->path, resources, err);
+  if (UNLIKELY (ret < 0))
+    return ret;
+
   if (cgroup_manager->update_resources)
     {
       ret = cgroup_manager->update_resources (cgroup_status, state_root, resources, err);
@@ -268,6 +334,64 @@ libcrun_update_cgroup_resources (struct libcrun_cgroup_status *cgroup_status,
         return ret;
     }
   return update_cgroup_resources (cgroup_status->path, state_root, resources, ! cgroup_status->bpf_dev_set, err);
+}
+
+int
+libcrun_cgroup_add_device_rules (struct libcrun_cgroup_status *cgroup_status,
+                                 runtime_spec_schema_defs_linux_device_cgroup **devs, size_t devs_len,
+                                 libcrun_error_t *err)
+{
+  cleanup_free char *scope_path = NULL;
+  const char *paths[2];
+  size_t n_paths = 0, i;
+  int cgroup_mode;
+  int rootless;
+  int ret;
+
+  if (cgroup_status->manager == CGROUP_MANAGER_DISABLED || is_empty_string (cgroup_status->path))
+    return crun_make_error (err, 0, "cannot add a device: the container has no cgroup");
+
+  cgroup_mode = libcrun_get_cgroup_mode (err);
+  if (UNLIKELY (cgroup_mode < 0))
+    return cgroup_mode;
+
+  if (cgroup_mode != CGROUP_MODE_UNIFIED)
+    return crun_make_error (err, 0, "adding a device is not supported on cgroup v1");
+
+  rootless = is_rootless (err);
+  if (UNLIKELY (rootless < 0))
+    return rootless;
+
+  if (rootless)
+    return crun_make_error (err, 0, "adding a device is not supported for rootless containers");
+
+  /* With systemd the device filter is attached to the scope, unless systemd could not install it.  */
+#ifdef HAVE_SYSTEMD
+  if (cgroup_status->manager == CGROUP_MANAGER_SYSTEMD && ! is_empty_string (cgroup_status->scope))
+    {
+      scope_path = get_cgroup_scope_path (cgroup_status->path, cgroup_status->scope);
+      if (scope_path)
+        paths[n_paths++] = scope_path;
+    }
+#endif
+  if (scope_path == NULL || strcmp (scope_path, cgroup_status->path) != 0)
+    paths[n_paths++] = cgroup_status->path;
+
+  for (i = 0; i < n_paths; i++)
+    {
+      cleanup_close int dirfd = -1;
+
+      dirfd = open_cgroup_subsystem ("", paths[i], err);
+      if (UNLIKELY (dirfd < 0))
+        return dirfd;
+
+      ret = libcrun_ebpf_devices_add (devs, devs_len, dirfd, err);
+      if (ret <= 0)
+        return ret;
+    }
+
+  return crun_make_error (err, 0, "adding a device is not supported: no eBPF device filter that can be updated is attached to the cgroup `%s`",
+                          paths[0]);
 }
 
 static int
@@ -325,6 +449,21 @@ libcrun_cgroup_preenter (struct libcrun_cgroup_args *args, int *dirfd, libcrun_e
   return cgroup_manager->precreate_cgroup (args, dirfd, err);
 }
 
+/* Remove the cgroup created by libcrun_cgroup_preenter if libcrun_cgroup_enter
+   did not take it over: until then the caller has no status to destroy it with.
+   Being created by us and without any process joining it, it is empty and a
+   plain rmdir is enough.  */
+void
+libcrun_cgroup_preenter_cleanup (struct libcrun_cgroup_args *args)
+{
+  if (args->precreated_path == NULL)
+    return;
+
+  (void) rmdir (args->precreated_path);
+  free (args->precreated_path);
+  args->precreated_path = NULL;
+}
+
 int
 libcrun_cgroup_enter (struct libcrun_cgroup_args *args, struct libcrun_cgroup_status **out, libcrun_error_t *err)
 {
@@ -374,6 +513,17 @@ libcrun_cgroup_enter (struct libcrun_cgroup_args *args, struct libcrun_cgroup_st
           return ignore_cgroup_errors;
         }
 
+      if (ignore_cgroup_errors && args->resources)
+        {
+          /* The limits cannot be set without a cgroup.  */
+          ret = update_cgroup_resources (NULL, args->state_root, args->resources, false, &tmp_err);
+          if (UNLIKELY (ret < 0))
+            {
+              crun_error_release (&tmp_err);
+              return crun_error_wrap (err, "cannot set limits without cgroups");
+            }
+        }
+
       if (ignore_cgroup_errors)
         {
           /* Ignore cgroups errors and set there is no cgroup path to use.  */
@@ -384,11 +534,20 @@ libcrun_cgroup_enter (struct libcrun_cgroup_args *args, struct libcrun_cgroup_st
           status->manager = CGROUP_MANAGER_DISABLED;
           crun_error_release (err);
 
+          if (! has_new_pid_namespace (args->container->container_def))
+            libcrun_error (0, "creating a rootless container with no cgroup and no private PID namespace.  "
+                              "Such configuration is strongly discouraged, as it is impossible to properly kill all "
+                              "the container processes");
+
           goto success;
         }
 
       return ret;
     }
+
+  /* From now on the cgroup is destroyed through its status.  */
+  free (args->precreated_path);
+  args->precreated_path = NULL;
 
   if (status->path)
     {

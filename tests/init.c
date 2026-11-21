@@ -39,6 +39,7 @@
 #include <sys/types.h>
 #include <sched.h>
 
+#include <linux/keyctl.h>
 #include <linux/netlink.h>
 #include <linux/rtnetlink.h>
 #include <netinet/in.h>
@@ -186,6 +187,7 @@ check_idmapped_mounts (const char *path)
     0,
   };
   char proc_path[64];
+  pid_t ppid = getpid ();
   int open_tree_fd;
   pid_t pid;
   int fd;
@@ -196,6 +198,9 @@ check_idmapped_mounts (const char *path)
   if (pid == 0)
     {
       prctl (PR_SET_PDEATHSIG, SIGKILL);
+      /* The parent might have exited before PR_SET_PDEATHSIG was set.  */
+      if (getppid () != ppid)
+        _exit (EXIT_SUCCESS);
       while (1)
         pause ();
       _exit (EXIT_SUCCESS);
@@ -350,6 +355,38 @@ do_pause ()
     remaining = sleep (remaining);
 
   exit (0);
+}
+
+static int
+pause_thread (void *arg)
+{
+  (void) arg;
+  do_pause ();
+  return 0;
+}
+
+static void
+fork_and_exit_main_thread ()
+{
+  static char stack[64 * 1024] __attribute__ ((aligned (16)));
+  const int flags = CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD;
+  pid_t pid;
+
+  pid = fork ();
+  if (pid < 0)
+    error (EXIT_FAILURE, errno, "fork");
+
+  if (pid == 0)
+    {
+      if (clone (pause_thread, stack + sizeof (stack), flags, NULL) < 0)
+        error (EXIT_FAILURE, errno, "clone");
+
+      close (1);
+      close (2);
+
+      /* Terminate only the main thread, not the whole thread group.  */
+      syscall (__NR_exit, 0);
+    }
 }
 
 static int
@@ -590,6 +627,13 @@ main (int argc, char **argv)
       return open_only (argv[2], O_WRONLY);
     }
 
+  if (strcmp (argv[1], "openrdwr") == 0)
+    {
+      if (argc < 3)
+        error (EXIT_FAILURE, 0, "'openrdwr' requires an argument");
+      return open_only (argv[2], O_RDWR);
+    }
+
   if (strcmp (argv[1], "access") == 0)
     {
       if (argc < 3)
@@ -816,6 +860,54 @@ main (int argc, char **argv)
     {
       do_pause ();
     }
+  if (strcmp (argv[1], "long-stdin-path") == 0)
+    {
+      /* Once the file "restored" shows up in the specified directory, replace
+         the stdin with a file whose path is longer than PATH_MAX.  CRIU cannot
+         checkpoint such a file, so until then keep open only its grandparent
+         directory, whose path is short enough.  */
+      char name[NAME_MAX + 1], file[NAME_MAX + 3];
+      int basefd, dirfd, fd, i;
+
+      if (argc < 3)
+        error (EXIT_FAILURE, 0, "'long-stdin-path' requires an argument");
+
+      memset (name, 'a', NAME_MAX);
+      name[NAME_MAX] = '\0';
+      snprintf (file, sizeof (file), "%s/f", name);
+
+      basefd = open (argv[2], O_RDONLY | O_DIRECTORY);
+      if (basefd < 0 || fchdir (basefd) < 0)
+        error (EXIT_FAILURE, errno, "open `%s`", argv[2]);
+      for (i = 0; i < PATH_MAX / (NAME_MAX + 1) - 1; i++)
+        if (mkdir (name, 0700) < 0 || chdir (name) < 0)
+          error (EXIT_FAILURE, errno, "mkdir");
+      dirfd = open (".", O_RDONLY | O_DIRECTORY);
+      if (dirfd < 0 || mkdir (name, 0700) < 0)
+        error (EXIT_FAILURE, errno, "mkdir");
+      fd = open (file, O_CREAT | O_WRONLY, 0600);
+      if (fd < 0 || chdir ("/") < 0)
+        error (EXIT_FAILURE, errno, "create file");
+      close (fd);
+
+      fd = openat (basefd, "ready", O_CREAT | O_WRONLY, 0600);
+      if (fd < 0)
+        error (EXIT_FAILURE, errno, "create `ready`");
+      close (fd);
+
+      while (faccessat (basefd, "restored", F_OK, 0) < 0)
+        nanosleep ((const struct timespec[]) { { 0, 10000000L } }, NULL);
+
+      fd = openat (dirfd, file, O_RDONLY);
+      if (fd < 0 || dup2 (fd, 0) < 0)
+        error (EXIT_FAILURE, errno, "replace stdin");
+      do_pause ();
+    }
+  if (strcmp (argv[1], "fork-and-exit-main-thread") == 0)
+    {
+      fork_and_exit_main_thread ();
+      do_pause ();
+    }
   if (strcmp (argv[1], "exit-on-signal") == 0)
     {
       /* Exit with a distinctive status once SIGUSR1 is received.  Unlike a
@@ -823,6 +915,31 @@ main (int argc, char **argv)
          since the kernel does not apply the default disposition to it.  */
       if (signal (SIGUSR1, handle_signal) == SIG_ERR)
         error (EXIT_FAILURE, errno, "signal SIGUSR1");
+      do_pause ();
+    }
+  if (strcmp (argv[1], "exit-main-thread") == 0)
+    {
+      /* Leave the thread group leader as a zombie while another thread of
+         the process keeps running.  */
+      static char stack[64 * 1024] __attribute__ ((aligned (16)));
+      int flags = CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD;
+
+      if (clone (pause_thread, stack + sizeof (stack), flags, NULL) < 0)
+        error (EXIT_FAILURE, errno, "clone");
+      syscall (__NR_exit, 0);
+    }
+  if (strcmp (argv[1], "nested-userns") == 0)
+    {
+      /* Move to a new user namespace, keeping the mount namespace.  */
+      if (unshare (CLONE_NEWUSER) < 0)
+        error (EXIT_FAILURE, errno, "unshare");
+      do_pause ();
+    }
+  if (strcmp (argv[1], "nested-userns-mountns") == 0)
+    {
+      /* Move to a mount namespace owned by a new user namespace.  */
+      if (unshare (CLONE_NEWUSER | CLONE_NEWNS) < 0)
+        error (EXIT_FAILURE, errno, "unshare");
       do_pause ();
     }
   if (strcmp (argv[1], "memhog") == 0)
@@ -937,6 +1054,15 @@ main (int argc, char **argv)
       return 0;
     }
 
+  if (strcmp (argv[1], "session-keyring") == 0)
+    {
+      long id = syscall (__NR_keyctl, KEYCTL_GET_KEYRING_ID, KEY_SPEC_SESSION_KEYRING, 0);
+      if (id < 0)
+        error (EXIT_FAILURE, errno, "keyctl");
+      printf ("%ld\n", id);
+      return 0;
+    }
+
   if (strcmp (argv[1], "check-feature") == 0)
     {
       if (argc < 3)
@@ -975,6 +1101,19 @@ main (int argc, char **argv)
 
           ret = syscall (__NR_move_mount);
           return (ret >= 0 || errno != ENOSYS) ? 0 : 1;
+#else
+          return 1;
+#endif
+        }
+      else if (strcmp (argv[2], "openat2") == 0)
+        {
+#if defined __NR_openat2
+          /* struct open_how: flags, mode, resolve.  */
+          uint64_t how[3] = { O_PATH | O_CLOEXEC, 0, 0 };
+          int ret;
+
+          ret = syscall (__NR_openat2, AT_FDCWD, "/", how, sizeof (how));
+          return ret >= 0 ? 0 : 1;
 #else
           return 1;
 #endif

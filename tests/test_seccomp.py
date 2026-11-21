@@ -805,6 +805,63 @@ def test_seccomp_invalid_flag():
     return run_and_expect_error(conf, ["unknown seccomp option", "SECCOMP_FILTER_FLAG_NOT_A_FLAG"])
 
 
+def test_seccomp_exec_missing_bpf():
+    """exec must fail if seccomp is configured but the generated filter is missing."""
+    conf = base_config()
+    add_all_namespaces(conf)
+
+    conf['linux']['seccomp'] = {
+        'defaultAction': 'SCMP_ACT_ALLOW',
+    }
+
+    conf['process']['args'] = ['/init', 'pause']
+
+    cid = None
+    try:
+        _, cid = run_and_get_output(conf, hide_stderr=True, command='run', detach=True)
+        run_crun_command(["exec", cid, "/init", "true"])
+
+        os.unlink(os.path.join(get_tests_root_status(), cid, "seccomp.bpf"))
+        try:
+            run_crun_command(["exec", cid, "/init", "true"])
+        except subprocess.CalledProcessError:
+            return 0
+        logger.info("exec succeeded without the seccomp filter")
+        return -1
+    except Exception as e:
+        logger.info("Exception: %s", e)
+        return -1
+    finally:
+        if cid is not None:
+            run_crun_command(["delete", "-f", cid])
+
+
+def test_seccomp_start_cpu_affinity():
+    if len(os.sched_getaffinity(0)) < 2:
+        return 77
+
+    conf = base_config()
+    add_all_namespaces(conf)
+    conf['process']['args'] = ['/init', 'cat', '/proc/self/status']
+    conf['process']['noNewPrivileges'] = True
+    conf['process']['cpuAffinity'] = {"startContainer": "0-1"}
+    conf['linux']['seccomp'] = {
+        'defaultAction': 'SCMP_ACT_ALLOW',
+        'syscalls': [{'names': ['sched_setaffinity'], 'action': 'SCMP_ACT_ERRNO'}]
+    }
+    try:
+        out, _ = run_and_get_output(conf, hide_stderr=True)
+    except Exception as e:
+        logger.info("container failed to start: %s", e)
+        return -1
+    for l in out.split("\n"):
+        parts = l.split(":")
+        if parts[0] == "Cpus_allowed_list":
+            if parts[1].strip() == "0-1":
+                return 0
+            logger.info("cpu mask %s != 0-1", parts[1].strip())
+    return -1
+
 all_tests = {
     "seccomp-listener": test_seccomp_listener,
     "seccomp-block-syscall": test_seccomp_block_syscall,
@@ -829,6 +886,8 @@ all_tests = {
     "seccomp-invalid-arg-index": test_seccomp_invalid_arg_index,
     "seccomp-invalid-arg-index-unknown-syscall": test_seccomp_invalid_arg_index_unknown_syscall,
     "seccomp-invalid-flag": test_seccomp_invalid_flag,
+    "seccomp-exec-missing-bpf": test_seccomp_exec_missing_bpf,
+    "seccomp-start-cpu-affinity": test_seccomp_start_cpu_affinity,
 }
 
 if __name__ == "__main__":
